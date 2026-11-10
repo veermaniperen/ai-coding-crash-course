@@ -1,0 +1,16 @@
+{
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/node:2.1.2": {},
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0.5": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {
+      "version": "latest"
+    }
+  },
+  "mounts": [
+    "source=${localWorkspaceFolder}/../claude-settings,target=/home/vscode/.claude,type=bind",
+    "source=${localWorkspaceFolder}/../github-settings,target=/home/vscode/.config/gh,type=bind"
+  ],
+  "forwardPorts": [5173],
+  "containerEnv": {"DISABLED_ANTHROPIC_BASE_URL": "http://localhost:8787"}
+}
