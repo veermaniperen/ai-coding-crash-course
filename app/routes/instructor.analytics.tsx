@@ -5,8 +5,10 @@ import type { Route } from "./+types/instructor.analytics";
 import { requireInstructorOrAdmin } from "~/lib/access.server";
 import {
   getAnalyticsCourses,
+  getCountryRevenue,
   getCourseProgress,
   getDropOffFunnel,
+  getQuizPassRates,
   getRevenueOverTime,
   getRevenueSummary,
   hasPublishedCourses,
@@ -103,7 +105,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     instructorId,
     courseDetail:
       tab === "course"
-        ? loadCourseDetail(instructorId, params.get("course"))
+        ? loadCourseDetail(instructorId, params.get("course"), range)
         : null,
     hasPublishedCourses: hasPublishedCourses(instructorId),
     revenue: getRevenueSummary(instructorId, range),
@@ -117,7 +119,8 @@ export async function loader({ request }: Route.LoaderArgs) {
  */
 function loadCourseDetail(
   instructorId: number | null,
-  courseParam: string | null
+  courseParam: string | null,
+  range: AnalyticsRange
 ): CourseDetailData {
   const courses = getAnalyticsCourses(instructorId);
   const selected =
@@ -125,13 +128,24 @@ function loadCourseDetail(
     courses.find((c) => c.status === CourseStatus.Published) ??
     courses[0];
   if (!selected) {
-    return { courses, selectedCourseId: null, progress: null, funnel: null };
+    return {
+      courses,
+      selectedCourseId: null,
+      range,
+      progress: null,
+      funnel: null,
+      quizPassRates: [],
+      countryRevenue: null,
+    };
   }
   return {
     courses,
     selectedCourseId: selected.id,
+    range,
     progress: getCourseProgress(selected.id),
     funnel: getDropOffFunnel(selected.id),
+    quizPassRates: getQuizPassRates(selected.id),
+    countryRevenue: getCountryRevenue(selected.id, range),
   };
 }
 

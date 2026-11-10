@@ -3,10 +3,15 @@ import { BookOpen, Users } from "lucide-react";
 import { CourseStatus } from "~/db/schema";
 import type {
   AnalyticsCourse,
+  CountryRevenueMix,
   CourseProgress,
   DropOffFunnel,
   FunnelLesson,
+  QuizPassRate,
 } from "~/services/analyticsService";
+import { ANALYTICS_RANGE_LABELS, type AnalyticsRange } from "~/lib/analytics";
+import { COUNTRIES } from "~/lib/ppp";
+import { formatPrice } from "~/lib/utils";
 import {
   Card,
   CardContent,
@@ -25,14 +30,18 @@ import {
 // ─── Course detail tab ───
 // Pick one course and diagnose it. The picker writes `?course=<id>`; the
 // loader resolves it against the courses this viewer may see. Lesson progress
-// has no start timestamp, so these panels ignore the range filter and say
-// "all time" instead.
+// has no start timestamp, so those panels ignore the range filter and say
+// "all time" instead; quiz pass rates are per student on their best attempt,
+// also all time. Only the country revenue mix follows the range.
 
 export type CourseDetailData = {
   courses: AnalyticsCourse[];
   selectedCourseId: number | null;
+  range: AnalyticsRange;
   progress: CourseProgress | null;
   funnel: DropOffFunnel | null;
+  quizPassRates: QuizPassRate[];
+  countryRevenue: CountryRevenueMix | null;
 };
 
 const ALL_TIME = "All time";
@@ -40,8 +49,11 @@ const ALL_TIME = "All time";
 export function CourseDetail({
   courses,
   selectedCourseId,
+  range,
   progress,
   funnel,
+  quizPassRates,
+  countryRevenue,
 }: CourseDetailData) {
   if (courses.length === 0 || selectedCourseId === null) {
     return (
@@ -69,6 +81,15 @@ export function CourseDetail({
           <DropOffFunnelCard funnel={funnel} />
         </>
       )}
+
+      {/* Outside the enrolment check: a team buyer's revenue can exist before
+          anyone redeems a seat. */}
+      <div className="grid gap-6 lg:grid-cols-2">
+        <QuizPassRatesCard quizzes={quizPassRates} />
+        {countryRevenue && (
+          <CountryRevenueCard mix={countryRevenue} range={range} />
+        )}
+      </div>
     </div>
   );
 }
@@ -223,6 +244,137 @@ function FunnelRow({
       </span>
     </li>
   );
+}
+
+function QuizPassRatesCard({ quizzes }: { quizzes: QuizPassRate[] }) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Quiz pass rates</CardTitle>
+        <CardDescription>
+          Share of students who passed, counting each student once on their
+          best attempt · {ALL_TIME.toLowerCase()}
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {quizzes.length === 0 ? (
+          <p className="py-8 text-center text-sm text-muted-foreground">
+            This course has no quizzes yet.
+          </p>
+        ) : (
+          <ul className="space-y-4">
+            {quizzes.map((quiz) => (
+              <li key={quiz.quizId} className="space-y-1.5 text-sm">
+                <div className="flex items-baseline justify-between gap-4">
+                  <span className="min-w-0 truncate" title={quiz.title}>
+                    <span className="font-medium">{quiz.title}</span>
+                    <span className="ml-1.5 text-xs text-muted-foreground">
+                      {quiz.lessonTitle}
+                    </span>
+                  </span>
+                  <span className="shrink-0 tabular-nums">
+                    {quiz.studentCount === 0 ? (
+                      <span className="text-muted-foreground">
+                        No attempts yet
+                      </span>
+                    ) : (
+                      <>
+                        <span className="font-medium">
+                          {Math.round(quiz.passRate * 100)}%
+                        </span>
+                        <span className="ml-1.5 text-xs text-muted-foreground">
+                          {quiz.passedCount} of {quiz.studentCount}
+                        </span>
+                      </>
+                    )}
+                  </span>
+                </div>
+                <Bar fraction={quiz.passRate} />
+              </li>
+            ))}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+const COUNTRY_NAMES = new Map(COUNTRIES.map((c) => [c.code, c.name]));
+
+function CountryRevenueCard({
+  mix,
+  range,
+}: {
+  mix: CountryRevenueMix;
+  range: AnalyticsRange;
+}) {
+  const rangeLabel = ANALYTICS_RANGE_LABELS[range].toLowerCase();
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Revenue by country</CardTitle>
+        <CardDescription>
+          Gross revenue by buyer country · {rangeLabel}
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {mix.countries.length === 0 ? (
+          <p className="py-8 text-center text-sm text-muted-foreground">
+            {range === "all"
+              ? "No sales of this course yet."
+              : "No sales of this course in this period yet. Try a longer range."}
+          </p>
+        ) : (
+          <div className="space-y-5">
+            <div className="rounded-md border p-3">
+              <p className="text-sm text-muted-foreground">
+                From PPP-discounted countries
+              </p>
+              <p className="text-2xl font-semibold tabular-nums">
+                {Math.round(mix.discountedShare * 100)}%
+                <span className="ml-2 text-sm font-normal text-muted-foreground">
+                  {formatCents(mix.discountedCents)} of{" "}
+                  {formatCents(mix.grossCents)}
+                </span>
+              </p>
+            </div>
+            <ul className="space-y-2">
+              {mix.countries.map((row) => (
+                <li
+                  key={row.country ?? "unknown"}
+                  className="grid grid-cols-[minmax(0,10rem)_1fr_5.5rem] items-center gap-3 text-sm"
+                >
+                  <span className="truncate">
+                    {row.country
+                      ? (COUNTRY_NAMES.get(row.country) ?? row.country)
+                      : "Unknown"}
+                    {row.discount > 0 && (
+                      <span className="ml-1.5 text-xs text-muted-foreground">
+                        {Math.round(row.discount * 100)}% off
+                      </span>
+                    )}
+                  </span>
+                  <Bar fraction={row.grossCents / mix.grossCents} />
+                  <span className="text-right tabular-nums">
+                    {formatCents(row.grossCents)}
+                    <span className="block text-xs text-muted-foreground">
+                      {row.purchaseCount} sale{row.purchaseCount === 1 ? "" : "s"}
+                    </span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/** `formatPrice` renders 0 as "Free", which reads wrong for revenue. */
+function formatCents(cents: number) {
+  return cents === 0 ? "$0.00" : formatPrice(cents);
 }
 
 /** The app's progress-bar idiom: a plain div track and fill. */
