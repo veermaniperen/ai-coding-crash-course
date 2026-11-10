@@ -1,10 +1,11 @@
 import Database from "better-sqlite3";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import { migrate } from "drizzle-orm/better-sqlite3/migrator";
 import path from "path";
 import { fileURLToPath } from "url";
 import * as schema from "../app/db/schema";
+import { calculatePppPrice } from "../app/lib/ppp";
 import {
   UserRole,
   CourseStatus,
@@ -73,7 +74,9 @@ async function seed() {
   console.log("Tables created.");
 
   // ─── Users ───
-  // 1 admin, 2 instructors, 5 students
+  // 1 admin, 3 instructors (Priya has no courses, so the analytics empty state
+  // is reachable), 40 students. The first five students and Bossy are the
+  // hand-written cast used throughout; the rest are appended further down.
 
   const [admin] = db
     .insert(schema.users)
@@ -82,7 +85,7 @@ async function seed() {
       email: "alex.rivera@ralph.dev",
       role: UserRole.Admin,
       avatarUrl: "https://api.dicebear.com/9.x/avataaars/svg?seed=alex",
-      createdAt: daysAgo(120),
+      createdAt: daysAgo(400),
     })
     .returning()
     .all();
@@ -95,7 +98,7 @@ async function seed() {
       role: UserRole.Instructor,
       avatarUrl: "https://api.dicebear.com/9.x/avataaars/svg?seed=sarah",
       bio: "Senior TypeScript engineer with 10 years of experience building large-scale web applications. Previously at Stripe and Vercel. Passionate about type safety and developer tooling.",
-      createdAt: daysAgo(100),
+      createdAt: daysAgo(380),
     })
     .returning()
     .all();
@@ -108,7 +111,22 @@ async function seed() {
       role: UserRole.Instructor,
       avatarUrl: "https://api.dicebear.com/9.x/avataaars/svg?seed=marcus",
       bio: "Full-stack developer and API architect specializing in Node.js and cloud infrastructure. Has built and scaled APIs serving millions of requests daily. Conference speaker and open-source contributor.",
-      createdAt: daysAgo(95),
+      createdAt: daysAgo(350),
+    })
+    .returning()
+    .all();
+
+  // Instructor with no courses — the analytics "publish your first course"
+  // empty state.
+  const [instructor3] = db
+    .insert(schema.users)
+    .values({
+      name: "Priya Natarajan",
+      email: "priya.natarajan@ralph.dev",
+      role: UserRole.Instructor,
+      avatarUrl: "https://api.dicebear.com/9.x/avataaars/svg?seed=priya",
+      bio: "Data engineer turned educator. Working on her first course.",
+      createdAt: daysAgo(14),
     })
     .returning()
     .all();
@@ -167,8 +185,69 @@ async function seed() {
     .returning()
     .all();
 
+  // Further students are APPENDED to `students` (never inserted before the
+  // first five): comments, progress, and coupon redemptions below pick
+  // students by array position, so inserting would silently re-point them.
+  const extraStudentNames = [
+    "Diane Foster", // purchasing manager — team buyer for course 1, never enrols
+    "Raj Patel", // purchasing manager — team buyer for course 5, never enrols
+    "Noah Bennett",
+    "Ava Collins",
+    "Mateo Garcia",
+    "Chloe Nguyen",
+    "Ethan Brooks",
+    "Isabella Rossi",
+    "Lucas Schmidt",
+    "Mia Kowalski",
+    "Arjun Mehta",
+    "Grace Okafor",
+    "Daniel Silva",
+    "Zoe Campbell",
+    "Chidi Eze",
+    "Hannah Lee",
+    "Ryan O'Connor",
+    "Amelia Hughes",
+    "Miguel Santos",
+    "Lily Morgan",
+    "Carlos Hernandez",
+    "Ben Carter",
+    "Priyanka Rao",
+    "Felix Wagner",
+    "Camille Dubois",
+    "Jack Turner",
+    "Anna Nowak",
+    "Thabo Nkosi",
+    "Sam Wright",
+    "Ella Fischer",
+    "Kevin Mwangi",
+    "Nora Andersson",
+    "Tom Baker",
+    "Elsa Lindqvist",
+  ];
+
+  const extraStudents = db
+    .insert(schema.users)
+    .values(
+      extraStudentNames.map((name, i) => {
+        const handle = name
+          .toLowerCase()
+          .replace(/[^a-z]+/g, ".")
+          .replace(/\.$/, "");
+        return {
+          name,
+          email: `${handle}@student.dev`,
+          role: UserRole.Student,
+          avatarUrl: `https://api.dicebear.com/9.x/avataaars/svg?seed=${encodeURIComponent(handle)}`,
+          createdAt: daysAgo(370 - i),
+        };
+      })
+    )
+    .returning()
+    .all();
+  students.push(...extraStudents);
+
   console.log(
-    `Created ${1 + 2 + students.length + 1} users (1 admin, 2 instructors, ${students.length + 1} students).`
+    `Created ${1 + 3 + students.length + 1} users (1 admin, 3 instructors, ${students.length + 1} students).`
   );
 
   // ─── Categories ───
@@ -233,7 +312,7 @@ By the end of this course, you'll understand why TypeScript has become the defau
       status: CourseStatus.Published,
       coverImageUrl: "/images/course-typescript.svg",
       price: 4999,
-      createdAt: daysAgo(90),
+      createdAt: daysAgo(365),
       updatedAt: daysAgo(10),
     })
     .returning()
@@ -614,7 +693,7 @@ Practice by converting an existing JavaScript project to TypeScript. Start with 
         courseId: course1.id,
         title: modData.title,
         position: mi + 1,
-        createdAt: daysAgo(90 - mi),
+        createdAt: daysAgo(365 - mi),
       })
       .returning()
       .all();
@@ -633,7 +712,7 @@ Practice by converting an existing JavaScript project to TypeScript. Start with 
             null,
           position: li + 1,
           durationMinutes: lessonData.duration,
-          createdAt: daysAgo(90 - mi),
+          createdAt: daysAgo(365 - mi),
         })
         .returning()
         .all();
@@ -694,7 +773,7 @@ Every lesson is focused and practical. No 45-minute lectures where 40 minutes ar
       status: CourseStatus.Published,
       coverImageUrl: "/images/course-nodejs.svg",
       price: 5999,
-      createdAt: daysAgo(75),
+      createdAt: daysAgo(330),
       updatedAt: daysAgo(5),
     })
     .returning()
@@ -1115,7 +1194,7 @@ You've completed the Building REST APIs course. You now have the skills to build
         courseId: course2.id,
         title: modData.title,
         position: mi + 1,
-        createdAt: daysAgo(75 - mi),
+        createdAt: daysAgo(330 - mi),
       })
       .returning()
       .all();
@@ -1134,7 +1213,7 @@ You've completed the Building REST APIs course. You now have the skills to build
             null,
           position: li + 1,
           durationMinutes: lessonData.duration,
-          createdAt: daysAgo(75 - mi),
+          createdAt: daysAgo(330 - mi),
         })
         .returning()
         .all();
@@ -1144,6 +1223,171 @@ You've completed the Building REST APIs course. You now have the skills to build
 
   console.log(
     `Created course "${course2.title}" with ${c2Modules.length} modules and ${course2LessonIds.length} lessons.`
+  );
+
+  // ─── Courses 3–5 (shorter, analytics-focused) ───
+  // Course 3: published, zero sales and zero enrolments (per-panel empty states).
+  // Course 4: draft (must not appear as a selling course).
+  // Course 5: Marcus's second published course, sold since ~10 months ago,
+  //           including one fully redeemed team purchase.
+
+  type ShortModule = {
+    title: string;
+    lessons: { title: string; duration: number }[];
+  };
+
+  function insertShortCourse(
+    courseValues: typeof schema.courses.$inferInsert,
+    courseModules: ShortModule[],
+    createdDaysAgo: number
+  ) {
+    const [course] = db
+      .insert(schema.courses)
+      .values({
+        ...courseValues,
+        createdAt: daysAgo(createdDaysAgo),
+        updatedAt: daysAgo(Math.max(0, createdDaysAgo - 20)),
+      })
+      .returning()
+      .all();
+
+    const lessonIds: number[] = [];
+    courseModules.forEach((modData, mi) => {
+      const [mod] = db
+        .insert(schema.modules)
+        .values({
+          courseId: course.id,
+          title: modData.title,
+          position: mi + 1,
+          createdAt: daysAgo(createdDaysAgo),
+        })
+        .returning()
+        .all();
+
+      modData.lessons.forEach((lessonData, li) => {
+        const [lesson] = db
+          .insert(schema.lessons)
+          .values({
+            moduleId: mod.id,
+            title: lessonData.title,
+            content: `## ${lessonData.title}\n\nIn this lesson we work through **${lessonData.title.toLowerCase()}** step by step, then you practise it on the course project.`,
+            position: li + 1,
+            durationMinutes: lessonData.duration,
+            createdAt: daysAgo(createdDaysAgo),
+          })
+          .returning()
+          .all();
+        lessonIds.push(lesson.id);
+      });
+    });
+
+    console.log(
+      `Created course "${course.title}" (${course.status}) with ${courseModules.length} modules and ${lessonIds.length} lessons.`
+    );
+    return { course, lessonIds };
+  }
+
+  const { course: course3 } = insertShortCourse(
+    {
+      title: "Advanced TypeScript Patterns",
+      slug: "advanced-typescript-patterns",
+      description:
+        "Go beyond the basics: branded types, type-level programming, and library-grade generics.",
+      salesCopy:
+        "## Type-level TypeScript\n\nFor developers who already ship TypeScript and want to write the types other people depend on.",
+      instructorId: instructor1.id,
+      categoryId: catBySlug["programming"].id,
+      status: CourseStatus.Published,
+      coverImageUrl: "/images/course-typescript.svg",
+      price: 7999,
+    },
+    [
+      {
+        title: "Type-Level Foundations",
+        lessons: [
+          { title: "Branded Types", duration: 9 },
+          { title: "Template Literal Types in Depth", duration: 12 },
+          { title: "Recursive Conditional Types", duration: 14 },
+        ],
+      },
+      {
+        title: "Library-Grade Generics",
+        lessons: [
+          { title: "Inference Sites", duration: 11 },
+          { title: "Const Type Parameters", duration: 7 },
+          { title: "Designing a Typed Builder API", duration: 18 },
+        ],
+      },
+    ],
+    45
+  );
+
+  insertShortCourse(
+    {
+      title: "Testing React Applications",
+      slug: "testing-react-applications",
+      description:
+        "Write tests that give you confidence: Testing Library, MSW, and component contracts.",
+      salesCopy:
+        "## Tests you can trust\n\nA practical guide to testing React apps without testing implementation details.",
+      instructorId: instructor1.id,
+      categoryId: catBySlug["programming"].id,
+      status: CourseStatus.Draft,
+      price: 5999,
+    },
+    [
+      {
+        title: "Getting Started",
+        lessons: [
+          { title: "Why Test UI?", duration: 6 },
+          { title: "Your First Testing Library Test", duration: 10 },
+        ],
+      },
+    ],
+    20
+  );
+
+  const { course: course5, lessonIds: course5LessonIds } = insertShortCourse(
+    {
+      title: "Docker for Node.js Developers",
+      slug: "docker-for-nodejs-developers",
+      description:
+        "Containerise your Node.js services: images, multi-stage builds, Compose, and production deploys.",
+      salesCopy:
+        "## Ship the same thing you tested\n\nLearn Docker from the perspective of a Node.js developer who just wants their app to run everywhere.",
+      instructorId: instructor2.id,
+      categoryId: catBySlug["devops"].id,
+      status: CourseStatus.Published,
+      coverImageUrl: "/images/course-nodejs.svg",
+      price: 3999,
+    },
+    [
+      {
+        title: "Containers 101",
+        lessons: [
+          { title: "What Is a Container?", duration: 8 },
+          { title: "Your First Dockerfile", duration: 12 },
+          { title: "Layers and Caching", duration: 10 },
+        ],
+      },
+      {
+        title: "Building Real Images",
+        lessons: [
+          { title: "Multi-Stage Builds", duration: 15 },
+          { title: "Docker Compose for Local Dev", duration: 16 },
+          { title: "Environment and Secrets", duration: 9 },
+        ],
+      },
+      {
+        title: "Production",
+        lessons: [
+          { title: "Health Checks", duration: 7 },
+          { title: "Image Security Scanning", duration: 11 },
+          { title: "Deploying to a Container Platform", duration: 14 },
+        ],
+      },
+    ],
+    300
   );
 
   // ─── Quizzes ───
@@ -1740,42 +1984,66 @@ You've completed the Building REST APIs course. You now have the skills to build
   console.log("Created quiz attempts and answers.");
 
   // ─── Video Watch Events ───
-  // Sprinkle some realistic watch events
+  // Mirrors what app/components/youtube-player.tsx actually sends: "play" when
+  // playback starts, a "progress" heartbeat every 10 seconds while playing,
+  // then "pause" or "ended". The player never emits "seek".
 
-  function addWatchEvent(
+  const HEARTBEAT_SECONDS = 10;
+
+  function watchSession(
     userId: number,
     lessonId: number,
-    eventType: string,
-    positionSeconds: number,
-    eventDaysAgo: number
+    fromSeconds: number,
+    toSeconds: number,
+    endEvent: "pause" | "ended",
+    sessionDaysAgo: number
   ) {
-    db.insert(schema.videoWatchEvents)
-      .values({
+    const start = new Date(daysAgo(sessionDaysAgo)).getTime();
+    const at = (position: number) =>
+      new Date(start + (position - fromSeconds) * 1000).toISOString();
+
+    const rows: (typeof schema.videoWatchEvents.$inferInsert)[] = [
+      {
         userId,
         lessonId,
-        eventType,
-        positionSeconds,
-        createdAt: daysAgo(eventDaysAgo),
-      })
-      .run();
+        eventType: "play",
+        positionSeconds: fromSeconds,
+        createdAt: at(fromSeconds),
+      },
+    ];
+    for (
+      let pos = fromSeconds + HEARTBEAT_SECONDS;
+      pos < toSeconds;
+      pos += HEARTBEAT_SECONDS
+    ) {
+      rows.push({
+        userId,
+        lessonId,
+        eventType: "progress",
+        positionSeconds: pos,
+        createdAt: at(pos),
+      });
+    }
+    rows.push({
+      userId,
+      lessonId,
+      eventType: endEvent,
+      positionSeconds: toSeconds,
+      createdAt: at(toSeconds),
+    });
+    db.insert(schema.videoWatchEvents).values(rows).run();
   }
 
-  // Emma watching course 1 lesson 1 (8 min video)
-  addWatchEvent(students[0].id, course1LessonIds[0], "play", 0, 50);
-  addWatchEvent(students[0].id, course1LessonIds[0], "pause", 180, 50);
-  addWatchEvent(students[0].id, course1LessonIds[0], "play", 180, 49);
-  addWatchEvent(students[0].id, course1LessonIds[0], "ended", 480, 49);
+  // Emma watching course 1 lesson 1 (8 min video): pauses at 3:00, resumes next day
+  watchSession(students[0].id, course1LessonIds[0], 0, 180, "pause", 50);
+  watchSession(students[0].id, course1LessonIds[0], 180, 480, "ended", 49);
 
-  // James watching course 1 lesson 1
-  addWatchEvent(students[1].id, course1LessonIds[0], "play", 0, 45);
-  addWatchEvent(students[1].id, course1LessonIds[0], "ended", 480, 45);
+  // James watching course 1 lesson 1 straight through
+  watchSession(students[1].id, course1LessonIds[0], 0, 480, "ended", 45);
 
-  // Liam started watching course 2 lesson 1 but stopped mid-way
-  addWatchEvent(students[3].id, course2LessonIds[0], "play", 0, 22);
-  addWatchEvent(students[3].id, course2LessonIds[0], "pause", 300, 22);
-  addWatchEvent(students[3].id, course2LessonIds[0], "seek", 150, 21);
-  addWatchEvent(students[3].id, course2LessonIds[0], "play", 150, 21);
-  addWatchEvent(students[3].id, course2LessonIds[0], "pause", 360, 21);
+  // Liam started course 2 lesson 1 but stopped mid-way, twice
+  watchSession(students[3].id, course2LessonIds[0], 0, 300, "pause", 22);
+  watchSession(students[3].id, course2LessonIds[0], 150, 360, "pause", 21);
 
   console.log("Created video watch events.");
 
@@ -1913,18 +2181,520 @@ You've completed the Building REST APIs course. You now have the skills to build
     `Created 1 team with Bossy McBossface as admin, 1 team purchase, and ${seededCoupons.length} coupons (2 redeemed, 3 available).`
   );
 
-  console.log("\n✓ Seed complete!");
-  console.log("  Users: 9 (1 admin, 2 instructors, 6 students)");
-  console.log("  Categories: 5");
+  // ─── A Year of Sales History ───
+  // Gives the analytics dashboard something to distinguish: purchases spread
+  // across the last ~12 months with rows in every range bucket (<7d, 7–30d,
+  // 30–90d, >90d), more team purchases, and lesson progress with planted
+  // drop-off cliffs. Every buyer here comes from `extraStudents`, never from
+  // `students` by position.
+
+  const courseByKey = {
+    c1: { course: course1, lessonIds: course1LessonIds },
+    c2: { course: course2, lessonIds: course2LessonIds },
+    c5: { course: course5, lessonIds: course5LessonIds },
+  };
+  type CourseKey = keyof typeof courseByKey;
+
+  // PLANTED DROP-OFF CLIFFS — 1-based lesson positions in course order.
+  // Most history students stop just before one of these lessons, so in a
+  // "reached at least this lesson" funnel the count falls sharply AT the
+  // listed lesson. The summary at the end recomputes the biggest drops from
+  // the inserted rows so you can check the funnel against this answer.
+  const PLANTED_CLIFFS: Record<CourseKey, number[]> = {
+    c1: [6, 13],
+    c2: [4, 11],
+    c5: [5],
+  };
+
+  // Furthest lesson reached, cycled per enrolment. "cliff-N" means the
+  // student stops on the lesson just before cliff N; "end" means finished.
+  type Stop = "early" | "cliff-0" | "cliff-1" | "end";
+  const STOP_PATTERN: Record<CourseKey, Stop[]> = {
+    c1: [
+      "cliff-0",
+      "end",
+      "cliff-0",
+      "cliff-1",
+      "cliff-0",
+      "early",
+      "cliff-1",
+      "end",
+      "cliff-0",
+      "cliff-1",
+    ],
+    c2: [
+      "cliff-0",
+      "end",
+      "cliff-0",
+      "cliff-1",
+      "cliff-0",
+      "early",
+      "cliff-1",
+      "end",
+      "cliff-0",
+      "cliff-1",
+    ],
+    c5: [
+      "cliff-0",
+      "end",
+      "cliff-0",
+      "cliff-0",
+      "end",
+      "early",
+      "cliff-0",
+      "end",
+    ],
+  };
+
+  // [extraStudents index, course, days ago, country]. PPP is applied from the
+  // country, matching what checkout would have charged.
+  const individualPurchases: [number, CourseKey, number, string][] = [
+    // Older than 90 days
+    [7, "c1", 350, "US"],
+    [8, "c1", 340, "GB"],
+    [9, "c2", 320, "DE"],
+    [10, "c1", 300, "IN"],
+    [11, "c5", 290, "US"],
+    [12, "c2", 280, "BR"],
+    [13, "c1", 260, "CA"],
+    [14, "c5", 250, "NG"],
+    [15, "c1", 230, "US"],
+    [16, "c2", 210, "AU"],
+    [17, "c1", 200, "PH"],
+    [17, "c2", 190, "PH"],
+    [18, "c5", 180, "US"],
+    [19, "c2", 170, "GB"],
+    [20, "c1", 160, "MX"],
+    [20, "c5", 155, "MX"],
+    [21, "c1", 150, "US"],
+    [22, "c2", 140, "IN"],
+    [23, "c5", 130, "DE"],
+    [24, "c1", 120, "US"],
+    [7, "c2", 110, "US"],
+    [24, "c2", 105, "US"],
+    [25, "c1", 100, "FR"],
+    [25, "c5", 98, "FR"],
+    [8, "c5", 95, "GB"],
+    // 30–90 days
+    [26, "c1", 85, "US"],
+    [27, "c2", 80, "PL"],
+    [28, "c1", 70, "ZA"],
+    [13, "c2", 65, "CA"],
+    [29, "c5", 60, "US"],
+    [29, "c1", 58, "US"],
+    [30, "c1", 55, "US"],
+    [10, "c2", 48, "IN"],
+    [31, "c1", 42, "KE"],
+    [31, "c2", 38, "KE"],
+    // 7–30 days
+    [32, "c2", 28, "US"],
+    [32, "c1", 26, "US"],
+    [33, "c1", 24, "SE"],
+    [15, "c5", 20, "US"],
+    [26, "c2", 18, "US"],
+    [28, "c2", 14, "ZA"],
+    [9, "c1", 12, "DE"],
+    [21, "c2", 9, "US"],
+    // Last 7 days (launch-week view)
+    [16, "c1", 6, "AU"],
+    [19, "c1", 5, "GB"],
+    [27, "c1", 4, "PL"],
+    [11, "c2", 3, "US"],
+    [30, "c2", 2, "US"],
+    [14, "c1", 2, "NG"],
+    [33, "c5", 1, "SE"],
+    [12, "c1", 0, "BR"],
+  ];
+
+  // Team purchases by purchasing managers who never enrol themselves.
+  // Diane: 4 seats of course 1, 2 redeemed, 2 unredeemed.
+  // Raj: 3 seats of course 5, all redeemed.
+  const teamPurchases: {
+    buyer: number;
+    course: CourseKey;
+    seats: number;
+    daysAgo: number;
+    country: string;
+    codePrefix: string;
+    redemptions: [number, number][]; // [extraStudents index, days ago]
+  }[] = [
+    {
+      buyer: 0,
+      course: "c1",
+      seats: 4,
+      daysAgo: 200,
+      country: "US",
+      codePrefix: "TEAM-TS-DIANE",
+      redemptions: [
+        [2, 198],
+        [3, 150],
+      ],
+    },
+    {
+      buyer: 1,
+      course: "c5",
+      seats: 3,
+      daysAgo: 120,
+      country: "GB",
+      codePrefix: "TEAM-DOCKER-RAJ",
+      redemptions: [
+        [4, 118],
+        [5, 117],
+        [6, 60],
+      ],
+    },
+  ];
+
+  // Every enrolment created here, in insertion order, for the progress pass.
+  const historyEnrollments: {
+    userId: number;
+    course: CourseKey;
+    enrolledDaysAgo: number;
+  }[] = [];
+
+  const seenEnrollment = new Set<string>();
+  function enrol(userId: number, course: CourseKey, enrolledDaysAgo: number) {
+    const key = `${userId}:${course}`;
+    if (seenEnrollment.has(key)) {
+      throw new Error(`Seed bug: user ${userId} enrolled twice in ${course}`);
+    }
+    seenEnrollment.add(key);
+    db.insert(schema.enrollments)
+      .values({
+        userId,
+        courseId: courseByKey[course].course.id,
+        enrolledAt: daysAgo(enrolledDaysAgo),
+      })
+      .run();
+    historyEnrollments.push({ userId, course, enrolledDaysAgo });
+  }
+
+  for (const [
+    studentIndex,
+    course,
+    purchaseDaysAgo,
+    country,
+  ] of individualPurchases) {
+    const buyer = extraStudents[studentIndex];
+    db.insert(schema.purchases)
+      .values({
+        userId: buyer.id,
+        courseId: courseByKey[course].course.id,
+        amountPaid: calculatePppPrice(
+          courseByKey[course].course.price,
+          country
+        ),
+        country,
+        createdAt: daysAgo(purchaseDaysAgo),
+      })
+      .run();
+    enrol(buyer.id, course, purchaseDaysAgo);
+  }
+
+  for (const team of teamPurchases) {
+    const buyer = extraStudents[team.buyer];
+    const { course } = courseByKey[team.course];
+
+    const [teamRow] = db
+      .insert(schema.teams)
+      .values({ createdAt: daysAgo(team.daysAgo) })
+      .returning()
+      .all();
+    db.insert(schema.teamMembers)
+      .values({
+        teamId: teamRow.id,
+        userId: buyer.id,
+        role: TeamMemberRole.Admin,
+        createdAt: daysAgo(team.daysAgo),
+      })
+      .run();
+
+    const [purchase] = db
+      .insert(schema.purchases)
+      .values({
+        userId: buyer.id,
+        courseId: course.id,
+        amountPaid: course.price * team.seats,
+        country: team.country,
+        createdAt: daysAgo(team.daysAgo),
+      })
+      .returning()
+      .all();
+
+    for (let seat = 0; seat < team.seats; seat++) {
+      const redemption = team.redemptions[seat];
+      const redeemer = redemption ? extraStudents[redemption[0]] : null;
+      db.insert(schema.coupons)
+        .values({
+          teamId: teamRow.id,
+          courseId: course.id,
+          code: `${team.codePrefix}-${seat + 1}`,
+          purchaseId: purchase.id,
+          redeemedByUserId: redeemer?.id ?? null,
+          redeemedAt: redemption ? daysAgo(redemption[1]) : null,
+          createdAt: daysAgo(team.daysAgo),
+        })
+        .run();
+      if (redeemer && redemption)
+        enrol(redeemer.id, team.course, redemption[1]);
+    }
+  }
+
+  // ─── History: lesson progress, quiz attempts, ratings, watch events ───
+
+  const stopCounters: Record<CourseKey, number> = { c1: 0, c2: 0, c5: 0 };
+  const markedCompleteFor = new Set<CourseKey>();
+  let skipperPlanted = false;
+
+  for (const enrolment of historyEnrollments) {
+    const { userId, course, enrolledDaysAgo } = enrolment;
+    const { lessonIds } = courseByKey[course];
+    const k = stopCounters[course]++;
+    const pattern = STOP_PATTERN[course];
+    const stop = pattern[k % pattern.length];
+    const cliffs = PLANTED_CLIFFS[course];
+
+    const furthest =
+      stop === "end"
+        ? lessonIds.length
+        : stop === "early"
+          ? 2
+          : cliffs[Number(stop.slice("cliff-".length))] - 1;
+
+    // Every third stopper is mid-lesson on their furthest lesson. In-progress
+    // still counts as "reached", so the cliff stays where it was planted.
+    const lastIsInProgress = stop !== "end" && k % 3 === 2;
+
+    // One course 1 finisher skips lesson 8 entirely but carries on — the
+    // funnel must still count them as present at lesson 8.
+    const skipPosition =
+      course === "c1" && stop === "end" && !skipperPlanted ? 8 : null;
+    if (skipPosition) skipperPlanted = true;
+
+    for (let pos = 1; pos <= furthest; pos++) {
+      if (pos === skipPosition) continue;
+      const lessonId = lessonIds[pos - 1];
+      if (pos === furthest && lastIsInProgress) {
+        markInProgress(userId, lessonId);
+        continue;
+      }
+      const completedDaysAgo = Math.floor(
+        enrolledDaysAgo * (1 - pos / (furthest + 1))
+      );
+      markComplete(userId, lessonId, completedDaysAgo);
+    }
+
+    // Enrolment completion is rarely marked in practice: only the first
+    // finisher per course gets completedAt.
+    if (stop === "end" && !markedCompleteFor.has(course)) {
+      markedCompleteFor.add(course);
+      db.update(schema.enrollments)
+        .set({ completedAt: daysAgo(Math.floor(enrolledDaysAgo / 4)) })
+        .where(
+          and(
+            eq(schema.enrollments.userId, userId),
+            eq(schema.enrollments.courseId, courseByKey[course].course.id)
+          )
+        )
+        .run();
+    }
+
+    // Quiz attempts on lessons the student completed past.
+    const attemptDay = (pos: number) =>
+      Math.floor(enrolledDaysAgo * (1 - pos / (furthest + 1)));
+    if (course === "c1" && furthest > 3) {
+      // Quiz 1 (lesson 3): two in three pass first time.
+      const correct = k % 3 === 0 ? [0] : [0, 1, 2];
+      recordQuizAttempt(
+        userId,
+        quiz1.id,
+        quiz1OptionIds,
+        correct,
+        attemptDay(3)
+      );
+    }
+    if (course === "c1" && furthest > 8 && skipPosition !== 8) {
+      // Quiz 2 (lesson 8): almost everyone passes.
+      const correct = k % 5 === 0 ? [0] : [0, 1];
+      recordQuizAttempt(
+        userId,
+        quiz2.id,
+        quiz2OptionIds,
+        correct,
+        attemptDay(8)
+      );
+    }
+    if (course === "c2" && furthest > 3) {
+      // Quiz 3 (lesson 3): the hard one — half fail.
+      const correct = k % 2 === 0 ? [0, 1, 2] : [1];
+      recordQuizAttempt(
+        userId,
+        quiz3.id,
+        quiz3OptionIds,
+        correct,
+        attemptDay(3)
+      );
+    }
+
+    // Roughly a third of history students leave a rating.
+    if (k % 3 === 1) {
+      const rating = stop === "end" ? 5 : stop === "early" ? 2 : 3 + (k % 2);
+      const ratedDaysAgo = Math.floor(enrolledDaysAgo / 2);
+      db.insert(schema.courseRatings)
+        .values({
+          userId,
+          courseId: courseByKey[course].course.id,
+          rating,
+          createdAt: daysAgo(ratedDaysAgo),
+          updatedAt: daysAgo(ratedDaysAgo),
+        })
+        .run();
+    }
+
+    // The first few students per course watch lesson 1's video.
+    if (k < 4) {
+      const lengthSeconds = 480;
+      if (stop === "end" || stop === "cliff-1") {
+        watchSession(
+          userId,
+          lessonIds[0],
+          0,
+          lengthSeconds,
+          "ended",
+          enrolledDaysAgo
+        );
+      } else {
+        watchSession(
+          userId,
+          lessonIds[0],
+          0,
+          120 + k * 60,
+          "pause",
+          enrolledDaysAgo
+        );
+      }
+    }
+  }
+
   console.log(
-    `  Courses: 2 (${course1LessonIds.length} + ${course2LessonIds.length} lessons)`
+    `Created ${individualPurchases.length} history purchases, ${teamPurchases.length} history team purchases, and ${historyEnrollments.length} history enrolments with progress.`
   );
-  console.log("  Quizzes: 3");
-  console.log("  Enrollments: 7");
-  console.log("  Course ratings: 6");
-  console.log("  Lesson comments: 15 (4 questions awaiting an answer)");
-  console.log("  Purchases: 6 (5 individual + 1 team)");
-  console.log("  Teams: 1 (with 5 coupons)");
+
+  // ─── Summary ───
+  // Every number below is read back from the database, so it cannot go stale
+  // when the seed changes.
+
+  const count = (query: string, ...params: unknown[]) =>
+    (sqlite.prepare(query).get(...params) as { n: number }).n;
+
+  const cutoff = (days: number) => daysAgo(days);
+  const roleCount = (role: UserRole) =>
+    count("SELECT count(*) AS n FROM users WHERE role = ?", role);
+  const teamPurchaseCount = count(
+    "SELECT count(DISTINCT purchase_id) AS n FROM coupons"
+  );
+  const purchaseCount = count("SELECT count(*) AS n FROM purchases");
+
+  console.log("\n✓ Seed complete!");
+  console.log(
+    `  Users: ${count("SELECT count(*) AS n FROM users")} (${roleCount(UserRole.Admin)} admin, ${roleCount(UserRole.Instructor)} instructors, ${roleCount(UserRole.Student)} students)`
+  );
+  console.log(
+    `  Instructor with no courses: ${instructor3.name} <${instructor3.email}>`
+  );
+  console.log(`  Categories: ${count("SELECT count(*) AS n FROM categories")}`);
+  const courseRows = sqlite
+    .prepare(
+      `SELECT c.title, c.status, u.name AS instructor,
+         (SELECT count(*) FROM purchases p WHERE p.course_id = c.id) AS sales,
+         (SELECT count(*) FROM lessons l JOIN modules m ON m.id = l.module_id WHERE m.course_id = c.id) AS lessons
+       FROM courses c JOIN users u ON u.id = c.instructor_id ORDER BY c.id`
+    )
+    .all() as {
+    title: string;
+    status: string;
+    instructor: string;
+    sales: number;
+    lessons: number;
+  }[];
+  console.log(`  Courses: ${courseRows.length}`);
+  for (const c of courseRows) {
+    console.log(
+      `    - ${c.title} [${c.status}] by ${c.instructor}: ${c.lessons} lessons, ${c.sales} purchases`
+    );
+  }
+  console.log(`  Quizzes: ${count("SELECT count(*) AS n FROM quizzes")}`);
+  console.log(
+    `  Quiz attempts: ${count("SELECT count(*) AS n FROM quiz_attempts")} (${count("SELECT count(*) AS n FROM quiz_attempts WHERE passed = 1")} passed)`
+  );
+  console.log(
+    `  Enrollments: ${count("SELECT count(*) AS n FROM enrollments")}`
+  );
+  console.log(
+    `  Course ratings: ${count("SELECT count(*) AS n FROM course_ratings")}`
+  );
+  console.log(
+    `  Lesson comments: ${count("SELECT count(*) AS n FROM comments")}`
+  );
+  console.log(
+    `  Lesson progress rows: ${count("SELECT count(*) AS n FROM lesson_progress")}`
+  );
+  console.log(
+    `  Video watch events: ${count("SELECT count(*) AS n FROM video_watch_events")} (${count("SELECT count(*) AS n FROM video_watch_events WHERE event_type = 'progress'")} progress heartbeats)`
+  );
+  console.log(
+    `  Purchases: ${purchaseCount} (${purchaseCount - teamPurchaseCount} individual + ${teamPurchaseCount} team)`
+  );
+  console.log(
+    `    in last 7d: ${count("SELECT count(*) AS n FROM purchases WHERE created_at >= ?", cutoff(7))}, 30d: ${count("SELECT count(*) AS n FROM purchases WHERE created_at >= ?", cutoff(30))}, 90d: ${count("SELECT count(*) AS n FROM purchases WHERE created_at >= ?", cutoff(90))}, all time: ${purchaseCount}`
+  );
+  console.log(
+    `  Teams: ${count("SELECT count(*) AS n FROM teams")} (${count("SELECT count(*) AS n FROM coupons")} coupons, ${count("SELECT count(*) AS n FROM coupons WHERE redeemed_by_user_id IS NULL")} unredeemed)`
+  );
+  console.log(`  Zero-sales course: ${course3.title}`);
+
+  // Drop-off check: for each course, students who reached at least lesson N
+  // (any progress row at position >= N), then the biggest falls.
+  console.log("  Drop-off cliffs (planted vs. found in the data):");
+  for (const [key, { course, lessonIds }] of Object.entries(courseByKey) as [
+    CourseKey,
+    (typeof courseByKey)[CourseKey],
+  ][]) {
+    const furthestByStudent = new Map<number, number>();
+    const rows = sqlite
+      .prepare(
+        `SELECT user_id AS userId, lesson_id AS lessonId FROM lesson_progress
+         WHERE lesson_id IN (${lessonIds.map(() => "?").join(",")})`
+      )
+      .all(...lessonIds) as { userId: number; lessonId: number }[];
+    for (const row of rows) {
+      const pos = lessonIds.indexOf(row.lessonId) + 1;
+      furthestByStudent.set(
+        row.userId,
+        Math.max(furthestByStudent.get(row.userId) ?? 0, pos)
+      );
+    }
+    const reached = lessonIds.map(
+      (_, i) => [...furthestByStudent.values()].filter((f) => f >= i + 1).length
+    );
+    const drops = reached
+      .slice(1)
+      .map((n, i) => ({ position: i + 2, drop: reached[i] - n }))
+      .sort((a, b) => b.drop - a.drop)
+      .slice(0, PLANTED_CLIFFS[key].length);
+    const titleAt = (position: number) =>
+      (
+        sqlite
+          .prepare("SELECT title FROM lessons WHERE id = ?")
+          .get(lessonIds[position - 1]) as { title: string }
+      ).title;
+    console.log(
+      `    - ${course.title}: planted at lesson ${PLANTED_CLIFFS[key].map((p) => `${p} "${titleAt(p)}"`).join(", ")}; biggest drops at ${drops.map((d) => `lesson ${d.position} (-${d.drop})`).join(", ")}`
+    );
+  }
 }
 
-seed().catch(console.error);
+seed().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
