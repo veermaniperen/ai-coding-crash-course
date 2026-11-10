@@ -1,9 +1,12 @@
 import { Link, isRouteErrorResponse, useSearchParams } from "react-router";
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from "recharts";
-import { AlertTriangle, BarChart3, BookOpen } from "lucide-react";
+import { AlertTriangle, BookOpen } from "lucide-react";
 import type { Route } from "./+types/instructor.analytics";
 import { requireInstructorOrAdmin } from "~/lib/access.server";
 import {
+  getAnalyticsCourses,
+  getCourseProgress,
+  getDropOffFunnel,
   getRevenueOverTime,
   getRevenueSummary,
   hasPublishedCourses,
@@ -11,7 +14,11 @@ import {
   type RevenueSummary,
 } from "~/services/analyticsService";
 import { getUsersByRole } from "~/services/userService";
-import { UserRole } from "~/db/schema";
+import { CourseStatus, UserRole } from "~/db/schema";
+import {
+  CourseDetail,
+  type CourseDetailData,
+} from "~/components/analytics/course-detail";
 import {
   ANALYTICS_RANGES,
   ANALYTICS_RANGE_LABELS,
@@ -54,6 +61,8 @@ import {
 //   tab        — "overview" (default) | "course"
 //   range      — "7d" | "30d" (default) | "90d" | "all"
 //   instructor — admins only: an instructor's user id; absent = all instructors
+//   course     — Course detail tab: a course id from the viewer's courses;
+//                absent or foreign = first published course
 
 const TABS = ["overview", "course"] as const;
 type AnalyticsTab = (typeof TABS)[number];
@@ -92,9 +101,37 @@ export async function loader({ request }: Route.LoaderArgs) {
     range,
     instructors,
     instructorId,
+    courseDetail:
+      tab === "course"
+        ? loadCourseDetail(instructorId, params.get("course"))
+        : null,
     hasPublishedCourses: hasPublishedCourses(instructorId),
     revenue: getRevenueSummary(instructorId, range),
     revenueOverTime: getRevenueOverTime(instructorId, range),
+  };
+}
+
+/**
+ * `?course=<id>` is honoured only if it's one of the viewer's courses;
+ * otherwise the first published course (or first course) is selected.
+ */
+function loadCourseDetail(
+  instructorId: number | null,
+  courseParam: string | null
+): CourseDetailData {
+  const courses = getAnalyticsCourses(instructorId);
+  const selected =
+    courses.find((c) => c.id === Number(courseParam)) ??
+    courses.find((c) => c.status === CourseStatus.Published) ??
+    courses[0];
+  if (!selected) {
+    return { courses, selectedCourseId: null, progress: null, funnel: null };
+  }
+  return {
+    courses,
+    selectedCourseId: selected.id,
+    progress: getCourseProgress(selected.id),
+    funnel: getDropOffFunnel(selected.id),
   };
 }
 
@@ -107,6 +144,7 @@ export default function InstructorAnalytics({
     range,
     instructors,
     instructorId,
+    courseDetail,
     hasPublishedCourses,
     revenue,
     revenueOverTime,
@@ -211,16 +249,7 @@ export default function InstructorAnalytics({
           </TabsContent>
 
           <TabsContent value="course" className="mt-4">
-            <Card>
-              <CardContent className="py-12 text-center">
-                <BarChart3 className="mx-auto mb-4 size-12 text-muted-foreground" />
-                <p className="font-medium">Course detail is coming soon</p>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  Per-course drop-off, progress, quiz pass rates, and revenue by
-                  country will live here.
-                </p>
-              </CardContent>
-            </Card>
+            {courseDetail && <CourseDetail {...courseDetail} />}
           </TabsContent>
         </Tabs>
       )}

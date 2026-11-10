@@ -319,7 +319,7 @@ export function getDropOffFunnel(courseId: number): DropOffFunnel {
         students: sql<number>`count(*)`,
       })
       .from(furthestPerStudent)
-      .groupBy(furthestPerStudent.furthest)
+      .groupBy(sql`${furthestPerStudent.furthest}`)
       .all()
       .map((row) => [row.furthest, row.students])
   );
