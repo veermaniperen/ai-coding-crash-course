@@ -15,6 +15,8 @@ import {
   getAnalyticsCourses,
   getCourseProgress,
   getDropOffFunnel,
+  getCountryRevenue,
+  getQuizPassRates,
 } from "./analyticsService";
 
 // ─── Local fixture helpers (Course detail tab) ───
@@ -120,6 +122,58 @@ function makeStudent(
 /** Lessons 1..n, for "completed everything up to n". */
 function upTo(n: number) {
   return Array.from({ length: n }, (_, i) => i + 1);
+}
+
+/** A quiz on lesson n of the course. */
+function makeQuiz(
+  { lessonIds }: ReturnType<typeof makeCourse>,
+  lessonNumber: number,
+  title = `Quiz ${lessonNumber}`
+) {
+  return testDb
+    .insert(schema.quizzes)
+    .values({ lessonId: lessonIds[lessonNumber - 1], title, passingScore: 0.7 })
+    .returning()
+    .get();
+}
+
+/** Records attempts by one student, in order: true = passed, false = failed. */
+function attempt(
+  student: { id: number },
+  quiz: { id: number },
+  ...results: boolean[]
+) {
+  for (const passed of results) {
+    testDb
+      .insert(schema.quizAttempts)
+      .values({
+        userId: student.id,
+        quizId: quiz.id,
+        score: passed ? 0.9 : 0.4,
+        passed,
+      })
+      .run();
+  }
+}
+
+const NOW = new Date("2026-06-15T12:00:00.000Z");
+
+function daysBefore(days: number) {
+  return new Date(NOW.getTime() - days * 86_400_000).toISOString();
+}
+
+/** A purchase of the course by a fresh buyer from `country`. */
+function makePurchase(
+  { course }: ReturnType<typeof makeCourse>,
+  amountPaid: number,
+  country: string | null,
+  createdAt = daysBefore(1)
+) {
+  const buyer = makeUser();
+  testDb
+    .insert(schema.purchases)
+    .values({ userId: buyer.id, courseId: course.id, amountPaid, country, createdAt })
+    .run();
 }
 
 function reachedSeries(funnel: ReturnType<typeof getDropOffFunnel>) {
@@ -305,6 +359,109 @@ describe("getCourseProgress", () => {
       totalLessons: 0,
       averageProgress: 0,
       finishedCount: 0,
+    });
+  });
+});
+
+describe("getQuizPassRates", () => {
+  it("counts a student who failed then passed once, as passed", () => {
+    const course = makeCourse([2]);
+    const quiz = makeQuiz(course, 1);
+    attempt(makeStudent(course), quiz, false, true); // failed, then passed
+    attempt(makeStudent(course), quiz, false, false); // never passed
+    attempt(makeStudent(course), quiz, true);
+
+    expect(getQuizPassRates(course.course.id)).toEqual([
+      {
+        quizId: quiz.id,
+        title: "Quiz 1",
+        lessonTitle: "Lesson 1",
+        studentCount: 3,
+        passedCount: 2,
+        passRate: 2 / 3,
+      },
+    ]);
+  });
+
+  it("lists only this course's quizzes, in course order, including ones nobody has attempted", () => {
+    const course = makeCourse([1, 1]);
+    makeQuiz(course, 2, "Final quiz");
+    const earlier = makeQuiz(course, 1, "First quiz");
+    attempt(makeStudent(course), earlier, true);
+    const other = makeCourse([1]);
+    attempt(makeStudent(other), makeQuiz(other, 1), true);
+
+    expect(
+      getQuizPassRates(course.course.id).map((q) => [
+        q.title,
+        q.studentCount,
+        q.passRate,
+      ])
+    ).toEqual([
+      ["First quiz", 1, 1],
+      ["Final quiz", 0, 0],
+    ]);
+  });
+
+  it("returns an empty list for a course with no quizzes", () => {
+    const course = makeCourse([2]);
+    makeStudent(course, { completed: upTo(2) });
+
+    expect(getQuizPassRates(course.course.id)).toEqual([]);
+  });
+});
+
+describe("getCountryRevenue", () => {
+  it("breaks the course's gross revenue for the range down by country, summing to the total", () => {
+    const course = makeCourse([1]);
+    makePurchase(course, 4999, "US");
+    makePurchase(course, 4999, "US");
+    makePurchase(course, 2500, "IN"); // tier 3, 50% off
+    makePurchase(course, 1500, "NG"); // tier 4, 70% off
+    makePurchase(course, 4999, null); // no country recorded
+    makePurchase(course, 4999, "US", daysBefore(45)); // outside 30d
+    makePurchase(makeCourse([1]), 9999, "US"); // another course
+
+    const mix = getCountryRevenue(course.course.id, "30d", NOW);
+
+    expect(mix.grossCents).toBe(18997);
+    expect(mix.countries.map((c) => [c.country, c.grossCents, c.purchaseCount]))
+      .toEqual([
+        ["US", 9998, 2],
+        [null, 4999, 1],
+        ["IN", 2500, 1],
+        ["NG", 1500, 1],
+      ]);
+    expect(mix.countries.reduce((sum, c) => sum + c.grossCents, 0)).toBe(
+      mix.grossCents
+    );
+  });
+
+  it("shows how much revenue came from PPP-discounted countries", () => {
+    const course = makeCourse([1]);
+    makePurchase(course, 6000, "US");
+    makePurchase(course, 3000, "IN");
+    makePurchase(course, 1000, "KE");
+
+    const mix = getCountryRevenue(course.course.id, "all", NOW);
+
+    expect(mix.discountedCents).toBe(4000);
+    expect(mix.discountedShare).toBe(0.4);
+    expect(mix.countries.map((c) => [c.country, c.discount])).toEqual([
+      ["US", 0],
+      ["IN", 0.5],
+      ["KE", 0.7],
+    ]);
+  });
+
+  it("returns an empty breakdown, not NaN, for a course with no sales", () => {
+    const course = makeCourse([1]);
+
+    expect(getCountryRevenue(course.course.id, "all", NOW)).toEqual({
+      grossCents: 0,
+      discountedCents: 0,
+      discountedShare: 0,
+      countries: [],
     });
   });
 });

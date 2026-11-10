@@ -9,8 +9,11 @@ import {
   lessons,
   modules,
   purchases,
+  quizAttempts,
+  quizzes,
 } from "~/db/schema";
 import { PLATFORM_FEE_RATE, type AnalyticsRange } from "~/lib/analytics";
+import { getDiscountForCountry } from "~/lib/ppp";
 
 // ─── Analytics Service ───
 // Aggregate queries behind the instructor analytics page. Every figure here is
@@ -422,5 +425,122 @@ export function getCourseProgress(courseId: number): CourseProgress {
     totalLessons,
     averageProgress: possible === 0 ? 0 : (row?.completedLessons ?? 0) / possible,
     finishedCount: totalLessons === 0 ? 0 : (row?.finishedCount ?? 0),
+  };
+}
+
+export type QuizPassRate = {
+  quizId: number;
+  title: string;
+  lessonTitle: string;
+  /** Distinct students who attempted the quiz at least once. */
+  studentCount: number;
+  /** Students whose best attempt passed. */
+  passedCount: number;
+  /** passedCount / studentCount, 0–1; 0 when nobody has attempted it. */
+  passRate: number;
+};
+
+/**
+ * Pass rate per quiz in the course, in course order, all time. Counted per
+ * student on their best attempt — a student who failed and then passed counts
+ * once, as passed — so retries don't drag the rate down. Quizzes nobody has
+ * attempted are still listed, with zero students.
+ */
+export function getQuizPassRates(courseId: number): QuizPassRate[] {
+  const bestPerStudent = db
+    .select({
+      quizId: quizAttempts.quizId,
+      userId: quizAttempts.userId,
+      passed: sql<number>`max(${quizAttempts.passed})`.as("best_passed"),
+    })
+    .from(quizAttempts)
+    .groupBy(quizAttempts.quizId, quizAttempts.userId)
+    .as("best_per_student");
+
+  const rows = db
+    .select({
+      quizId: quizzes.id,
+      title: quizzes.title,
+      lessonTitle: lessons.title,
+      studentCount: sql<number>`count(${bestPerStudent.userId})`,
+      passedCount: sql<number>`coalesce(sum(${bestPerStudent.passed}), 0)`,
+    })
+    .from(quizzes)
+    .innerJoin(lessons, eq(lessons.id, quizzes.lessonId))
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .leftJoin(bestPerStudent, eq(bestPerStudent.quizId, quizzes.id))
+    .where(eq(modules.courseId, courseId))
+    .groupBy(quizzes.id)
+    .orderBy(lessonOrderKey, quizzes.id)
+    .all();
+
+  return rows.map((row) => ({
+    ...row,
+    passRate: row.studentCount === 0 ? 0 : row.passedCount / row.studentCount,
+  }));
+}
+
+export type CountryRevenue = {
+  /** ISO country code, or null when the purchase recorded no country. */
+  country: string | null;
+  grossCents: number;
+  purchaseCount: number;
+  /** The country's PPP discount, 0–1 (0 = full price). */
+  discount: number;
+};
+
+export type CountryRevenueMix = {
+  grossCents: number;
+  /** Revenue from purchases made in PPP-discounted countries. */
+  discountedCents: number;
+  /** discountedCents / grossCents, 0–1; 0 when there are no sales. */
+  discountedShare: number;
+  /** Highest-grossing country first. */
+  countries: CountryRevenue[];
+};
+
+/**
+ * The course's gross revenue in the range, broken down by buyer country, with
+ * the share that came from purchasing-power-parity discounted regions. A
+ * country's discount is its current PPP tier — purchases don't record the
+ * tier they were sold at — and a purchase with no country counts as full
+ * price.
+ */
+export function getCountryRevenue(
+  courseId: number,
+  range: AnalyticsRange,
+  now: Date = new Date()
+): CountryRevenueMix {
+  const conditions: SQL[] = [eq(purchases.courseId, courseId)];
+  const cutoff = resolveCutoff(range, now);
+  if (cutoff !== null) conditions.push(gte(purchases.createdAt, cutoff));
+
+  const grossCents = sql<number>`sum(${purchases.amountPaid})`;
+  const rows = db
+    .select({
+      country: purchases.country,
+      grossCents,
+      purchaseCount: sql<number>`count(*)`,
+    })
+    .from(purchases)
+    .where(and(...conditions))
+    .groupBy(purchases.country)
+    .orderBy(sql`${grossCents} desc`, sql`${purchases.country} is null`, purchases.country)
+    .all();
+
+  const countries = rows.map((row) => ({
+    ...row,
+    discount: getDiscountForCountry(row.country),
+  }));
+  const total = countries.reduce((sum, c) => sum + c.grossCents, 0);
+  const discountedCents = countries
+    .filter((c) => c.discount > 0)
+    .reduce((sum, c) => sum + c.grossCents, 0);
+
+  return {
+    grossCents: total,
+    discountedCents,
+    discountedShare: total === 0 ? 0 : discountedCents / total,
+    countries,
   };
 }
