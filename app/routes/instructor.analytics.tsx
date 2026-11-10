@@ -52,6 +52,17 @@ import {
   ChartTooltipContent,
   type ChartConfig,
 } from "~/components/ui/chart";
+import {
+  OverviewPanels,
+  OverviewPanelsSkeleton,
+} from "~/components/analytics/overview-panels";
+import {
+  getAudienceSummary,
+  getCourseRatings,
+  getTopBuyers,
+  getUnansweredQuestionCount,
+  getUnredeemedSeatCount,
+} from "~/services/analyticsService";
 
 // ─── Instructor Analytics ───
 // "How is my teaching business doing?" — one page, two tabs. All view state
@@ -110,6 +121,13 @@ export async function loader({ request }: Route.LoaderArgs) {
     hasPublishedCourses: hasPublishedCourses(instructorId),
     revenue: getRevenueSummary(instructorId, range),
     revenueOverTime: getRevenueOverTime(instructorId, range),
+    overview: {
+      audience: getAudienceSummary(instructorId, range),
+      topBuyers: getTopBuyers(instructorId, range),
+      unredeemedSeats: getUnredeemedSeatCount(instructorId),
+      unansweredQuestions: getUnansweredQuestionCount(instructorId),
+      ratings: getCourseRatings(instructorId),
+    },
   };
 }
 
@@ -260,6 +278,7 @@ export default function InstructorAnalytics({
           <TabsContent value="overview" className="mt-4 space-y-6">
             <RevenueFigures revenue={revenue} range={range} />
             <RevenueChart points={revenueOverTime} range={range} />
+            <OverviewPanels data={loaderData.overview} range={range} />
           </TabsContent>
 
           <TabsContent value="course" className="mt-4">
@@ -464,6 +483,7 @@ export function HydrateFallback() {
           <Skeleton className="h-36 w-full" />
         </div>
         <Skeleton className="h-[22rem] w-full" />
+        <OverviewPanelsSkeleton />
       </div>
     </div>
   );
