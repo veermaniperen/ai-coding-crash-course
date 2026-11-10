@@ -1,6 +1,15 @@
-import { and, eq, gte, sql, type SQL } from "drizzle-orm";
+import { and, eq, gte, ne, sql, type SQL } from "drizzle-orm";
 import { db } from "~/db";
-import { CourseStatus, courses, purchases } from "~/db/schema";
+import {
+  CourseStatus,
+  LessonProgressStatus,
+  courses,
+  enrollments,
+  lessonProgress,
+  lessons,
+  modules,
+  purchases,
+} from "~/db/schema";
 import { PLATFORM_FEE_RATE, type AnalyticsRange } from "~/lib/analytics";
 
 // ─── Analytics Service ───
@@ -173,4 +182,245 @@ export function hasPublishedCourses(instructorId: number | null): boolean {
     .limit(1)
     .get();
   return row !== undefined;
+}
+
+// ─── Course detail ───
+// Per-course diagnostics: drop-off funnel, average progress, finished count.
+// Lesson progress rows have no start timestamp (and only completed rows carry
+// a completion time), so none of these can honour the range filter. They are
+// all-time figures, and the page labels them that way.
+
+export type AnalyticsCourse = {
+  id: number;
+  title: string;
+  status: CourseStatus;
+};
+
+/**
+ * The courses the Course detail picker offers: the instructor's own, or every
+ * course for "All instructors" (null). The loader picks the selected course
+ * from this list, so it doubles as the ownership check on `?course=`.
+ */
+export function getAnalyticsCourses(
+  instructorId: number | null
+): AnalyticsCourse[] {
+  return db
+    .select({ id: courses.id, title: courses.title, status: courses.status })
+    .from(courses)
+    .where(
+      instructorId === null ? undefined : eq(courses.instructorId, instructorId)
+    )
+    .orderBy(courses.id)
+    .all();
+}
+
+/** Sorts lessons in course order: module position first, then lesson position. */
+const lessonOrderKey = sql<number>`${modules.position} * 100000 + ${lessons.position}`;
+
+type CourseLesson = {
+  lessonId: number;
+  title: string;
+  moduleId: number;
+  moduleTitle: string;
+  orderKey: number;
+};
+
+function getCourseLessons(courseId: number): CourseLesson[] {
+  return db
+    .select({
+      lessonId: lessons.id,
+      title: lessons.title,
+      moduleId: modules.id,
+      moduleTitle: modules.title,
+      orderKey: lessonOrderKey,
+    })
+    .from(lessons)
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .where(eq(modules.courseId, courseId))
+    .orderBy(modules.position, lessons.position)
+    .all();
+}
+
+function countEnrolled(courseId: number): number {
+  const row = db
+    .select({ count: sql<number>`count(distinct ${enrollments.userId})` })
+    .from(enrollments)
+    .where(eq(enrollments.courseId, courseId))
+    .get();
+  return row?.count ?? 0;
+}
+
+export type FunnelLesson = {
+  lessonId: number;
+  title: string;
+  /** 1-based position in course order, across modules. */
+  number: number;
+  /** Enrolled students who reached at least this lesson. */
+  reached: number;
+  /** Students lost since the previous lesson (or since enrolling, for lesson 1). */
+  drop: number;
+};
+
+export type FunnelModule = {
+  moduleId: number;
+  title: string;
+  /** Students who reached at least the module's first lesson. */
+  reached: number;
+  /** Students lost across the module: the sum of its lessons' drops. */
+  drop: number;
+  lessons: FunnelLesson[];
+};
+
+export type DropOffFunnel = {
+  enrolledCount: number;
+  modules: FunnelModule[];
+};
+
+/**
+ * Per-lesson drop-off, all time. Each lesson counts the enrolled students
+ * whose furthest lesson (any progress row, in-progress included) is at or
+ * beyond it. The series therefore only ever descends: a skipped lesson doesn't
+ * dip, and a gap between neighbours is where students quit.
+ */
+export function getDropOffFunnel(courseId: number): DropOffFunnel {
+  const courseLessons = getCourseLessons(courseId);
+  const enrolledCount = countEnrolled(courseId);
+
+  // Each enrolled student's furthest lesson, then how many students stopped
+  // at each. One grouped query, at most one row per lesson.
+  const furthestPerStudent = db
+    .select({
+      userId: lessonProgress.userId,
+      furthest: sql<number>`max(${lessonOrderKey})`.as("furthest"),
+    })
+    .from(lessonProgress)
+    .innerJoin(lessons, eq(lessons.id, lessonProgress.lessonId))
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .innerJoin(
+      enrollments,
+      and(
+        eq(enrollments.userId, lessonProgress.userId),
+        eq(enrollments.courseId, modules.courseId)
+      )
+    )
+    .where(
+      and(
+        eq(modules.courseId, courseId),
+        ne(lessonProgress.status, LessonProgressStatus.NotStarted)
+      )
+    )
+    .groupBy(lessonProgress.userId)
+    .as("furthest_per_student");
+
+  const stoppedAt = new Map(
+    db
+      .select({
+        furthest: furthestPerStudent.furthest,
+        students: sql<number>`count(*)`,
+      })
+      .from(furthestPerStudent)
+      .groupBy(furthestPerStudent.furthest)
+      .all()
+      .map((row) => [row.furthest, row.students])
+  );
+
+  // reached(lesson) = students whose furthest lesson is this one or later.
+  const reachedByLesson = new Map<number, number>();
+  let reached = 0;
+  for (let i = courseLessons.length - 1; i >= 0; i--) {
+    reached += stoppedAt.get(courseLessons[i].orderKey) ?? 0;
+    reachedByLesson.set(courseLessons[i].lessonId, reached);
+  }
+
+  const funnelModules: FunnelModule[] = [];
+  let previous = enrolledCount;
+  courseLessons.forEach((lesson, index) => {
+    const lessonReached = reachedByLesson.get(lesson.lessonId) ?? 0;
+    const row: FunnelLesson = {
+      lessonId: lesson.lessonId,
+      title: lesson.title,
+      number: index + 1,
+      reached: lessonReached,
+      drop: previous - lessonReached,
+    };
+    previous = lessonReached;
+
+    let mod = funnelModules.at(-1);
+    if (mod?.moduleId !== lesson.moduleId) {
+      mod = {
+        moduleId: lesson.moduleId,
+        title: lesson.moduleTitle,
+        reached: lessonReached,
+        drop: 0,
+        lessons: [],
+      };
+      funnelModules.push(mod);
+    }
+    mod.lessons.push(row);
+    mod.drop += row.drop;
+  });
+
+  return { enrolledCount, modules: funnelModules };
+}
+
+export type CourseProgress = {
+  enrolledCount: number;
+  totalLessons: number;
+  /** Mean of completed lessons / total lessons over enrollees, 0–1. */
+  averageProgress: number;
+  /** Enrollees who have completed every lesson. */
+  finishedCount: number;
+};
+
+/**
+ * Average progress and finished count, all time. Progress is lessons
+ * completed over total lessons — deliberately not duration-weighted, because
+ * a short lesson that sends the student off to an exercise is more work, not
+ * less. Enrollees with no progress count as 0%.
+ */
+export function getCourseProgress(courseId: number): CourseProgress {
+  const totalLessons = getCourseLessons(courseId).length;
+
+  const completedPerStudent = db
+    .select({
+      userId: lessonProgress.userId,
+      completed: sql<number>`count(distinct ${lessonProgress.lessonId})`.as(
+        "completed"
+      ),
+    })
+    .from(lessonProgress)
+    .innerJoin(lessons, eq(lessons.id, lessonProgress.lessonId))
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .where(
+      and(
+        eq(modules.courseId, courseId),
+        eq(lessonProgress.status, LessonProgressStatus.Completed)
+      )
+    )
+    .groupBy(lessonProgress.userId)
+    .as("completed_per_student");
+
+  const row = db
+    .select({
+      enrolledCount: sql<number>`count(*)`,
+      completedLessons: sql<number>`coalesce(sum(${completedPerStudent.completed}), 0)`,
+      finishedCount: sql<number>`coalesce(sum(case when ${completedPerStudent.completed} >= ${totalLessons} then 1 else 0 end), 0)`,
+    })
+    .from(enrollments)
+    .leftJoin(
+      completedPerStudent,
+      eq(completedPerStudent.userId, enrollments.userId)
+    )
+    .where(eq(enrollments.courseId, courseId))
+    .get();
+
+  const enrolledCount = row?.enrolledCount ?? 0;
+  const possible = enrolledCount * totalLessons;
+
+  return {
+    enrolledCount,
+    totalLessons,
+    averageProgress: possible === 0 ? 0 : (row?.completedLessons ?? 0) / possible,
+    finishedCount: totalLessons === 0 ? 0 : (row?.finishedCount ?? 0),
+  };
 }
