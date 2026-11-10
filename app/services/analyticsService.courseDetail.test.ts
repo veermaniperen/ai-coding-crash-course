@@ -16,6 +16,7 @@ import {
   getCourseProgress,
   getDropOffFunnel,
   getCountryRevenue,
+  getCourseDetail,
   getQuizPassRates,
 } from "./analyticsService";
 
@@ -40,9 +41,15 @@ function makeUser(role: schema.UserRole = schema.UserRole.Student) {
  * A published course whose modules hold the given number of lessons, e.g.
  * `[3, 2]` → module 1 has lessons 1-3, module 2 has lessons 4-5. Returns the
  * course and its lesson ids in course order, so `lessonIds[n - 1]` is lesson n.
+ * Creates a fresh instructor unless one is given.
  */
-function makeCourse(lessonsPerModule: number[]) {
-  const instructor = makeUser(schema.UserRole.Instructor);
+function makeCourse(
+  lessonsPerModule: number[],
+  {
+    instructor = makeUser(schema.UserRole.Instructor),
+    status = schema.CourseStatus.Published,
+  }: { instructor?: { id: number }; status?: schema.CourseStatus } = {}
+) {
   counter += 1;
   const course = testDb
     .insert(schema.courses)
@@ -53,7 +60,7 @@ function makeCourse(lessonsPerModule: number[]) {
       salesCopy: "Buy it",
       instructorId: instructor.id,
       categoryId,
-      status: schema.CourseStatus.Published,
+      status,
       price: 4999,
     })
     .returning()
@@ -174,6 +181,40 @@ function makePurchase(
     .insert(schema.purchases)
     .values({ userId: buyer.id, courseId: course.id, amountPaid, country, createdAt })
     .run();
+}
+
+/** A team purchase of `seats` seats by a fresh buyer from `country`. */
+function makeTeamPurchase(
+  { course }: ReturnType<typeof makeCourse>,
+  amountPaid: number,
+  country: string | null,
+  seats: number
+) {
+  const buyer = makeUser();
+  const purchase = testDb
+    .insert(schema.purchases)
+    .values({
+      userId: buyer.id,
+      courseId: course.id,
+      amountPaid,
+      country,
+      createdAt: daysBefore(1),
+    })
+    .returning()
+    .get();
+  const team = testDb.insert(schema.teams).values({}).returning().get();
+  for (let seat = 0; seat < seats; seat++) {
+    counter += 1;
+    testDb
+      .insert(schema.coupons)
+      .values({
+        teamId: team.id,
+        courseId: course.id,
+        code: `SEAT-${counter}`,
+        purchaseId: purchase.id,
+      })
+      .run();
+  }
 }
 
 function reachedSeries(funnel: ReturnType<typeof getDropOffFunnel>) {
@@ -314,6 +355,70 @@ describe("getAnalyticsCourses", () => {
   });
 });
 
+describe("getCourseDetail", () => {
+  it("selects the requested course when the viewer owns it", () => {
+    const first = makeCourse([1]);
+    const second = makeCourse([1], { instructor: first.instructor });
+    makeStudent(second);
+    makePurchase(second, 4999, "US");
+
+    const detail = getCourseDetail(first.instructor.id, second.course.id, "30d", NOW);
+
+    expect(detail.courses.map((c) => c.id)).toEqual([
+      first.course.id,
+      second.course.id,
+    ]);
+    expect(detail.selectedCourseId).toBe(second.course.id);
+    expect(detail.range).toBe("30d");
+    expect(detail.progress?.enrolledCount).toBe(1);
+    expect(detail.funnel?.enrolledCount).toBe(1);
+    expect(detail.countryRevenue?.grossCents).toBe(4999);
+  });
+
+  it("falls back to the first published course when no course is requested", () => {
+    const draft = makeCourse([1], { status: schema.CourseStatus.Draft });
+    const published = makeCourse([1], { instructor: draft.instructor });
+
+    expect(
+      getCourseDetail(draft.instructor.id, null, "30d", NOW).selectedCourseId
+    ).toBe(published.course.id);
+  });
+
+  it("ignores a course the viewer doesn't own and falls back to their own", () => {
+    const mine = makeCourse([1]);
+    const theirs = makeCourse([1]);
+    makePurchase(theirs, 9999, "US");
+
+    const detail = getCourseDetail(mine.instructor.id, theirs.course.id, "all", NOW);
+
+    expect(detail.selectedCourseId).toBe(mine.course.id);
+    expect(detail.countryRevenue?.grossCents).toBe(0);
+  });
+
+  it("lets the all-instructors view select any course", () => {
+    makeCourse([1]);
+    const other = makeCourse([1]);
+
+    expect(getCourseDetail(null, other.course.id, "30d", NOW).selectedCourseId).toBe(
+      other.course.id
+    );
+  });
+
+  it("selects nothing, with empty panels, for an instructor with no courses", () => {
+    const loner = makeUser(schema.UserRole.Instructor);
+
+    expect(getCourseDetail(loner.id, null, "30d", NOW)).toEqual({
+      courses: [],
+      selectedCourseId: null,
+      range: "30d",
+      progress: null,
+      funnel: null,
+      quizPassRates: [],
+      countryRevenue: null,
+    });
+  });
+});
+
 describe("getCourseProgress", () => {
   it("averages completed-over-total lessons across enrollees and counts finishers separately", () => {
     const course = makeCourse([2, 2]);
@@ -451,6 +556,27 @@ describe("getCountryRevenue", () => {
       ["US", 0],
       ["IN", 0.5],
       ["KE", 0.7],
+    ]);
+  });
+
+  it("counts a purchase as discounted only when the buyer paid less than list price", () => {
+    // List price is 4999. PPP was off when this Indian buyer bought, so they
+    // paid full price: their country's tier alone must not make it discounted.
+    const course = makeCourse([1]);
+    makePurchase(course, 4999, "IN"); // full price despite a tier-3 country
+    makePurchase(course, 2500, "IN"); // PPP price
+    makeTeamPurchase(course, 3 * 4999, "BR", 3); // full price for 3 seats
+    makeTeamPurchase(course, 3 * 3499, "BR", 3); // PPP price for 3 seats
+
+    const mix = getCountryRevenue(course.course.id, "all", NOW);
+
+    expect(mix.grossCents).toBe(4999 + 2500 + 3 * 4999 + 3 * 3499);
+    expect(mix.discountedCents).toBe(2500 + 3 * 3499);
+    expect(
+      mix.countries.map((c) => [c.country, c.grossCents, c.discountedCents])
+    ).toEqual([
+      ["BR", 3 * 4999 + 3 * 3499, 3 * 3499],
+      ["IN", 4999 + 2500, 2500],
     ]);
   });
 

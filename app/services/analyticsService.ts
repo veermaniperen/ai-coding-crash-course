@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, gte, isNull, ne, sql, type SQL } from "drizzle-orm";
+import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { db } from "~/db";
 import {
   CourseStatus,
@@ -15,7 +16,7 @@ import {
   quizzes,
   users,
 } from "~/db/schema";
-import { getUnansweredQuestions } from "~/services/commentService";
+import { countUnansweredQuestions } from "~/services/commentService";
 import { PLATFORM_FEE_RATE, type AnalyticsRange } from "~/lib/analytics";
 import { getDiscountForCountry } from "~/lib/ppp";
 
@@ -50,20 +51,40 @@ function resolveCutoff(range: AnalyticsRange, now: Date): string | null {
   return new Date(now.getTime() - days * DAY_MS).toISOString();
 }
 
-function purchaseConditions(
-  instructorId: number | null,
+/**
+ * `column >= cutoff` for the range, or undefined for all-time (drizzle's
+ * `and()` skips undefined, so callers can spread it in unconditionally).
+ */
+function cutoffCondition(
+  column: SQLiteColumn,
   range: AnalyticsRange,
   now: Date
-): SQL[] {
-  const conditions: SQL[] = [];
-  if (instructorId !== null) {
-    conditions.push(eq(courses.instructorId, instructorId));
-  }
+): SQL | undefined {
   const cutoff = resolveCutoff(range, now);
-  if (cutoff !== null) {
-    conditions.push(gte(purchases.createdAt, cutoff));
-  }
-  return conditions;
+  return cutoff === null ? undefined : gte(column, cutoff);
+}
+
+/** Scopes a query joined to `courses` to one instructor; null = everyone. */
+function instructorCondition(instructorId: number | null): SQL | undefined {
+  return instructorId === null
+    ? undefined
+    : eq(courses.instructorId, instructorId);
+}
+
+/**
+ * The instructor and range conditions every dated metric applies: the query
+ * must join `courses`, and `dateColumn` is the timestamp the range filters on.
+ */
+function scopeConditions(
+  instructorId: number | null,
+  dateColumn: SQLiteColumn,
+  range: AnalyticsRange,
+  now: Date
+): (SQL | undefined)[] {
+  return [
+    instructorCondition(instructorId),
+    cutoffCondition(dateColumn, range, now),
+  ];
 }
 
 export type RevenueSummary = {
@@ -85,7 +106,7 @@ export function getRevenueSummary(
     })
     .from(purchases)
     .innerJoin(courses, eq(courses.id, purchases.courseId))
-    .where(and(...purchaseConditions(instructorId, range, now)))
+    .where(and(...scopeConditions(instructorId, purchases.createdAt, range, now)))
     .get();
 
   const grossCents = row?.grossCents ?? 0;
@@ -129,7 +150,7 @@ export function getRevenueOverTime(
     })
     .from(purchases)
     .innerJoin(courses, eq(courses.id, purchases.courseId))
-    .where(and(...purchaseConditions(instructorId, range, now)))
+    .where(and(...scopeConditions(instructorId, purchases.createdAt, range, now)))
     .groupBy(period)
     .orderBy(period)
     .all();
@@ -178,14 +199,15 @@ function monthsBetween(startMonth: string, now: Date): string[] {
  * published.
  */
 export function hasPublishedCourses(instructorId: number | null): boolean {
-  const conditions: SQL[] = [eq(courses.status, CourseStatus.Published)];
-  if (instructorId !== null) {
-    conditions.push(eq(courses.instructorId, instructorId));
-  }
   const row = db
     .select({ id: courses.id })
     .from(courses)
-    .where(and(...conditions))
+    .where(
+      and(
+        eq(courses.status, CourseStatus.Published),
+        instructorCondition(instructorId)
+      )
+    )
     .limit(1)
     .get();
   return row !== undefined;
@@ -205,8 +227,8 @@ export type AnalyticsCourse = {
 
 /**
  * The courses the Course detail picker offers: the instructor's own, or every
- * course for "All instructors" (null). The loader picks the selected course
- * from this list, so it doubles as the ownership check on `?course=`.
+ * course for "All instructors" (null). `getCourseDetail` picks the selected
+ * course from this list, so it doubles as the ownership check on `?course=`.
  */
 export function getAnalyticsCourses(
   instructorId: number | null
@@ -214,9 +236,7 @@ export function getAnalyticsCourses(
   return db
     .select({ id: courses.id, title: courses.title, status: courses.status })
     .from(courses)
-    .where(
-      instructorId === null ? undefined : eq(courses.instructorId, instructorId)
-    )
+    .where(instructorCondition(instructorId))
     .orderBy(courses.id)
     .all();
 }
@@ -488,14 +508,16 @@ export type CountryRevenue = {
   /** ISO country code, or null when the purchase recorded no country. */
   country: string | null;
   grossCents: number;
+  /** The part of grossCents from purchases sold below list price. */
+  discountedCents: number;
   purchaseCount: number;
-  /** The country's PPP discount, 0–1 (0 = full price). */
+  /** The country's current PPP tier discount, 0–1 (0 = full price). */
   discount: number;
 };
 
 export type CountryRevenueMix = {
   grossCents: number;
-  /** Revenue from purchases made in PPP-discounted countries. */
+  /** Revenue from purchases sold below list price (PPP-discounted). */
   discountedCents: number;
   /** discountedCents / grossCents, 0–1; 0 when there are no sales. */
   discountedShare: number;
@@ -504,30 +526,44 @@ export type CountryRevenueMix = {
 };
 
 /**
+ * Whether the outer purchase was sold below list price: the amount paid is
+ * under the course's price times the seats bought (1 for an individual
+ * purchase, the coupon count for a team purchase). Purchases don't record the
+ * discount they were sold at, so this is judged from what the buyer actually
+ * paid rather than their country's tier — a buyer from a PPP country who paid
+ * full price (PPP switched off for the course) is not discounted. The caveat:
+ * it compares against today's list price, so a later price rise would make
+ * earlier full-price sales read as discounted.
+ */
+const soldBelowListPrice = sql<boolean>`${purchases.amountPaid} < ${courses.price} * max(1, (
+  select count(*) from coupons c where c.purchase_id = ${purchases.id}
+))`;
+
+/**
  * The course's gross revenue in the range, broken down by buyer country, with
- * the share that came from purchasing-power-parity discounted regions. A
- * country's discount is its current PPP tier — purchases don't record the
- * tier they were sold at — and a purchase with no country counts as full
- * price.
+ * the share that was sold at a PPP-discounted price (see soldBelowListPrice).
  */
 export function getCountryRevenue(
   courseId: number,
   range: AnalyticsRange,
   now: Date = new Date()
 ): CountryRevenueMix {
-  const conditions: SQL[] = [eq(purchases.courseId, courseId)];
-  const cutoff = resolveCutoff(range, now);
-  if (cutoff !== null) conditions.push(gte(purchases.createdAt, cutoff));
-
   const grossCents = sql<number>`sum(${purchases.amountPaid})`;
   const rows = db
     .select({
       country: purchases.country,
       grossCents,
+      discountedCents: sql<number>`coalesce(sum(case when ${soldBelowListPrice} then ${purchases.amountPaid} else 0 end), 0)`,
       purchaseCount: sql<number>`count(*)`,
     })
     .from(purchases)
-    .where(and(...conditions))
+    .innerJoin(courses, eq(courses.id, purchases.courseId))
+    .where(
+      and(
+        eq(purchases.courseId, courseId),
+        cutoffCondition(purchases.createdAt, range, now)
+      )
+    )
     .groupBy(purchases.country)
     .orderBy(sql`${grossCents} desc`, sql`${purchases.country} is null`, purchases.country)
     .all();
@@ -537,9 +573,10 @@ export function getCountryRevenue(
     discount: getDiscountForCountry(row.country),
   }));
   const total = countries.reduce((sum, c) => sum + c.grossCents, 0);
-  const discountedCents = countries
-    .filter((c) => c.discount > 0)
-    .reduce((sum, c) => sum + c.grossCents, 0);
+  const discountedCents = countries.reduce(
+    (sum, c) => sum + c.discountedCents,
+    0
+  );
 
   return {
     grossCents: total,
@@ -549,65 +586,70 @@ export function getCountryRevenue(
   };
 }
 
+export type CourseDetailData = {
+  /** The courses the picker offers: the viewer's own, or all for null. */
+  courses: AnalyticsCourse[];
+  /** null only when there are no courses to pick from. */
+  selectedCourseId: number | null;
+  range: AnalyticsRange;
+  progress: CourseProgress | null;
+  funnel: DropOffFunnel | null;
+  quizPassRates: QuizPassRate[];
+  countryRevenue: CountryRevenueMix | null;
+};
+
+/**
+ * Everything the Course detail tab shows. The requested course is honoured
+ * only if it's among the viewer's courses (so a foreign id falls back rather
+ * than leaking another instructor's figures); otherwise the first published
+ * course is selected, or failing that the first course.
+ */
+export function getCourseDetail(
+  instructorId: number | null,
+  requestedCourseId: number | null,
+  range: AnalyticsRange,
+  now: Date = new Date()
+): CourseDetailData {
+  const courses = getAnalyticsCourses(instructorId);
+  const selected =
+    courses.find((c) => c.id === requestedCourseId) ??
+    courses.find((c) => c.status === CourseStatus.Published) ??
+    courses[0];
+
+  if (!selected) {
+    return {
+      courses,
+      selectedCourseId: null,
+      range,
+      progress: null,
+      funnel: null,
+      quizPassRates: [],
+      countryRevenue: null,
+    };
+  }
+  return {
+    courses,
+    selectedCourseId: selected.id,
+    range,
+    progress: getCourseProgress(selected.id),
+    funnel: getDropOffFunnel(selected.id),
+    quizPassRates: getQuizPassRates(selected.id),
+    countryRevenue: getCountryRevenue(selected.id, range, now),
+  };
+}
+
 // ─── Overview: buyers, students, team seats, questions, ratings ───
 // A team purchase is one purchase row covering several coupons (seats). The
 // buyer usually never enrols, and each seat redeemer enrols with no purchase
 // row of their own, so buyers and students are counted from different tables
 // and never conflated.
 
-/** Instructor and cutoff conditions for `enrollments JOIN courses`. */
-function enrollmentConditions(
-  instructorId: number | null,
-  range: AnalyticsRange,
-  now: Date
-): SQL[] {
-  const conditions: SQL[] = [];
-  if (instructorId !== null) {
-    conditions.push(eq(courses.instructorId, instructorId));
-  }
-  const cutoff = resolveCutoff(range, now);
-  if (cutoff !== null) {
-    conditions.push(gte(enrollments.enrolledAt, cutoff));
-  }
-  return conditions;
-}
-
 export type AudienceSummary = {
   /** Distinct people with a purchase in range (team buyers included). */
   buyerCount: number;
   /** Distinct people who enrolled in range (seat redeemers included). */
   studentCount: number;
-  /**
-   * Revenue traced to those students' enrolments: an individual purchase
-   * counts in full; a redeemed seat counts as its team purchase's amount
-   * divided by the purchase's seat count. Unredeemed seats belong to nobody.
-   */
-  attributedRevenueCents: number;
-  /** attributedRevenueCents / studentCount, rounded; 0 with no students. */
-  revenuePerStudentCents: number;
 };
-
-/**
- * Revenue attributable to the outer `enrollments` row. Individual purchases
- * (those without coupons) by the enrollee for that course count in full; a
- * coupon the enrollee redeemed for that course walks back to its originating
- * team purchase and takes one seat's share of it.
- */
-const enrollmentRevenue = sql<number>`(
-  select coalesce(sum(p.amount_paid), 0)
-  from purchases p
-  where p.user_id = ${enrollments.userId}
-    and p.course_id = ${enrollments.courseId}
-    and not exists (select 1 from coupons pc where pc.purchase_id = p.id)
-) + (
-  select coalesce(sum(
-    tp.amount_paid * 1.0 / (select count(*) from coupons s where s.purchase_id = tp.id)
-  ), 0)
-  from coupons c
-  join purchases tp on tp.id = c.purchase_id
-  where c.redeemed_by_user_id = ${enrollments.userId}
-    and c.course_id = ${enrollments.courseId}
-)`;
 
 export function getAudienceSummary(
   instructorId: number | null,
@@ -618,46 +660,41 @@ export function getAudienceSummary(
     .select({ count: sql<number>`count(distinct ${purchases.userId})` })
     .from(purchases)
     .innerJoin(courses, eq(courses.id, purchases.courseId))
-    .where(and(...purchaseConditions(instructorId, range, now)))
+    .where(and(...scopeConditions(instructorId, purchases.createdAt, range, now)))
     .get();
 
   const students = db
-    .select({
-      count: sql<number>`count(distinct ${enrollments.userId})`,
-      revenue: sql<number>`coalesce(sum(${enrollmentRevenue}), 0)`,
-    })
+    .select({ count: sql<number>`count(distinct ${enrollments.userId})` })
     .from(enrollments)
     .innerJoin(courses, eq(courses.id, enrollments.courseId))
-    .where(and(...enrollmentConditions(instructorId, range, now)))
+    .where(and(...scopeConditions(instructorId, enrollments.enrolledAt, range, now)))
     .get();
-
-  const studentCount = students?.count ?? 0;
-  const attributedRevenueCents = Math.round(students?.revenue ?? 0);
 
   return {
     buyerCount: buyers?.count ?? 0,
-    studentCount,
-    attributedRevenueCents,
-    revenuePerStudentCents:
-      studentCount === 0 ? 0 : Math.round(attributedRevenueCents / studentCount),
+    studentCount: students?.count ?? 0,
   };
 }
 
 /**
- * Purchased team seats nobody has redeemed. A current snapshot, not a dated
- * metric — an open seat bought a year ago is still open — so it ignores range
- * and the page labels it "all time".
+ * Team seats bought in the range (by coupon creation time) that nobody has
+ * redeemed yet.
  */
-export function getUnredeemedSeatCount(instructorId: number | null): number {
-  const conditions: SQL[] = [isNull(coupons.redeemedByUserId)];
-  if (instructorId !== null) {
-    conditions.push(eq(courses.instructorId, instructorId));
-  }
+export function getUnredeemedSeatCount(
+  instructorId: number | null,
+  range: AnalyticsRange,
+  now: Date = new Date()
+): number {
   const row = db
     .select({ count: sql<number>`count(*)` })
     .from(coupons)
     .innerJoin(courses, eq(courses.id, coupons.courseId))
-    .where(and(...conditions))
+    .where(
+      and(
+        isNull(coupons.redeemedByUserId),
+        ...scopeConditions(instructorId, coupons.createdAt, range, now)
+      )
+    )
     .get();
   return row?.count ?? 0;
 }
@@ -708,7 +745,7 @@ export function getTopBuyers(
     .from(purchases)
     .innerJoin(courses, eq(courses.id, purchases.courseId))
     .innerJoin(users, eq(users.id, purchases.userId))
-    .where(and(...purchaseConditions(instructorId, range, now)))
+    .where(and(...scopeConditions(instructorId, purchases.createdAt, range, now)))
     .groupBy(users.id)
     .orderBy(desc(totalSpent), asc(users.name))
     .limit(TOP_BUYER_LIMIT)
@@ -718,12 +755,12 @@ export function getTopBuyers(
 }
 
 /**
- * Student questions still waiting on staff. Delegates to the instructor
- * question queue so "unanswered" has one definition. A current snapshot, so
- * it ignores range.
+ * Student questions still waiting on staff, counted in SQL with the question
+ * queue's own definition of "unanswered" (commentService). A current
+ * snapshot, so it ignores range.
  */
 export function getUnansweredQuestionCount(instructorId: number | null): number {
-  return getUnansweredQuestions(instructorId).length;
+  return countUnansweredQuestions(instructorId);
 }
 
 export type CourseRating = {
@@ -735,14 +772,14 @@ export type CourseRating = {
 };
 
 /**
- * Rating per published course, unrated courses included. Ratings are
- * cumulative opinions, not events, so this ignores range ("all time").
+ * Rating per published course from ratings left in the range (by
+ * `created_at`). Courses with no ratings in range are still listed, unrated.
  */
-export function getCourseRatings(instructorId: number | null): CourseRating[] {
-  const conditions: SQL[] = [eq(courses.status, CourseStatus.Published)];
-  if (instructorId !== null) {
-    conditions.push(eq(courses.instructorId, instructorId));
-  }
+export function getCourseRatings(
+  instructorId: number | null,
+  range: AnalyticsRange,
+  now: Date = new Date()
+): CourseRating[] {
   const rows = db
     .select({
       courseId: courses.id,
@@ -751,8 +788,21 @@ export function getCourseRatings(instructorId: number | null): CourseRating[] {
       ratingCount: sql<number>`count(${courseRatings.id})`,
     })
     .from(courses)
-    .leftJoin(courseRatings, eq(courseRatings.courseId, courses.id))
-    .where(and(...conditions))
+    // The cutoff sits in the join, not the WHERE, so a course with no ratings
+    // in range stays in the list.
+    .leftJoin(
+      courseRatings,
+      and(
+        eq(courseRatings.courseId, courses.id),
+        cutoffCondition(courseRatings.createdAt, range, now)
+      )
+    )
+    .where(
+      and(
+        eq(courses.status, CourseStatus.Published),
+        instructorCondition(instructorId)
+      )
+    )
     .groupBy(courses.id)
     .orderBy(asc(courses.title))
     .all();

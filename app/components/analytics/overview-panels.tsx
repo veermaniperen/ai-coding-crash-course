@@ -6,7 +6,7 @@ import type {
   TopBuyer,
 } from "~/services/analyticsService";
 import { ANALYTICS_RANGE_LABELS, type AnalyticsRange } from "~/lib/analytics";
-import { formatPrice } from "~/lib/utils";
+import { formatCents } from "~/lib/utils";
 import {
   Card,
   CardContent,
@@ -44,7 +44,7 @@ export function OverviewPanels({
 
   return (
     <>
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-4 sm:grid-cols-3">
         <StatCard
           label="Buyers"
           value={data.audience.buyerCount}
@@ -57,30 +57,16 @@ export function OverviewPanels({
           note={`People who enrolled, seat redeemers included · ${rangeLabel.toLowerCase()}`}
           empty="No new enrolments in this period yet"
         />
-        <Card>
-          <CardHeader>
-            <CardDescription>Revenue per student</CardDescription>
-            <CardTitle className="text-3xl tabular-nums">
-              {data.audience.studentCount === 0
-                ? "—"
-                : formatCents(data.audience.revenuePerStudentCents)}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="text-xs text-muted-foreground">
-            {data.audience.studentCount === 0
-              ? "No students in this period to divide by"
-              : `Team seats count as their share of the team purchase · ${rangeLabel.toLowerCase()}`}
-          </CardContent>
-        </Card>
         <AttentionCard
           icon={<Ticket className="size-4" />}
           label="Unredeemed seats"
           value={data.unredeemedSeats}
           note={
             data.unredeemedSeats === 0
-              ? "Every purchased team seat has been claimed"
+              ? "Every team seat bought has been claimed"
               : "Team seats bought but not yet claimed"
           }
+          window={rangeLabel}
         />
       </div>
 
@@ -100,6 +86,7 @@ export function OverviewPanels({
                 ? "No students are waiting on a reply"
                 : "Students waiting on a reply from staff"
             }
+            window="All time"
             action={
               data.unansweredQuestions > 0 ? (
                 <Link
@@ -111,7 +98,7 @@ export function OverviewPanels({
               ) : null
             }
           />
-          <RatingsPanel ratings={data.ratings} />
+          <RatingsPanel ratings={data.ratings} range={range} />
         </div>
       </div>
     </>
@@ -147,12 +134,15 @@ function AttentionCard({
   label,
   value,
   note,
+  window,
   action,
 }: {
   icon: React.ReactNode;
   label: string;
   value: number;
   note: string;
+  /** The period the figure covers, e.g. "Last 30 days" or "All time". */
+  window: string;
   action?: React.ReactNode;
 }) {
   return (
@@ -166,7 +156,7 @@ function AttentionCard({
       </CardHeader>
       <CardContent className="space-y-1 text-xs text-muted-foreground">
         <p>
-          {note} · all time
+          {note} · {window.toLowerCase()}
         </p>
         {action}
       </CardContent>
@@ -248,19 +238,30 @@ function TopBuyersPanel({
   );
 }
 
-function RatingsPanel({ ratings }: { ratings: CourseRating[] }) {
+function RatingsPanel({
+  ratings,
+  range,
+}: {
+  ratings: CourseRating[];
+  range: AnalyticsRange;
+}) {
   const anyRated = ratings.some((r) => r.ratingCount > 0);
 
   return (
     <Card>
       <CardHeader>
         <CardTitle>Course ratings</CardTitle>
-        <CardDescription>Published courses · all time</CardDescription>
+        <CardDescription>
+          Ratings left on published courses ·{" "}
+          {ANALYTICS_RANGE_LABELS[range].toLowerCase()}
+        </CardDescription>
       </CardHeader>
       <CardContent>
         {!anyRated ? (
           <p className="text-sm text-muted-foreground">
-            No student has rated your courses yet.
+            {range === "all"
+              ? "No student has rated your courses yet."
+              : "No ratings in this period yet. Try a longer range."}
           </p>
         ) : (
           <ul className="space-y-3">
@@ -300,17 +301,12 @@ function Badge({
   );
 }
 
-/** "$0.00" for zero, rather than formatPrice's "Free". */
-function formatCents(cents: number) {
-  return cents === 0 ? "$0.00" : formatPrice(cents);
-}
 
 /** Mirrors OverviewPanels' layout for the route's HydrateFallback. */
 export function OverviewPanelsSkeleton() {
   return (
     <>
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Skeleton className="h-36 w-full" />
+      <div className="grid gap-4 sm:grid-cols-3">
         <Skeleton className="h-36 w-full" />
         <Skeleton className="h-36 w-full" />
         <Skeleton className="h-36 w-full" />

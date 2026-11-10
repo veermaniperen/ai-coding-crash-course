@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { createTestDb } from "~/test/setup";
 import * as schema from "~/db/schema";
+import { eq } from "drizzle-orm";
 
 let testDb: ReturnType<typeof createTestDb>;
 
@@ -18,6 +19,7 @@ import {
   getUnansweredQuestionCount,
   getUnredeemedSeatCount,
 } from "./analyticsService";
+import { getUnansweredQuestions } from "./commentService";
 
 // ─── Overview tests: buyers, students, team seats, leaderboard, questions, ratings ───
 // Separate from analyticsService.test.ts so the fixtures for team purchases
@@ -120,6 +122,7 @@ function teamPurchase(
         purchaseId: purchase.id,
         redeemedByUserId: redeemer ?? null,
         redeemedAt: redeemer === undefined ? null : at,
+        createdAt: at,
       })
       .run();
     if (redeemer !== undefined) enrol(redeemer, courseId, at);
@@ -154,26 +157,6 @@ describe("getAudienceSummary", () => {
     expect(audience.buyerCount).toBe(2);
     expect(audience.studentCount).toBe(4);
   });
-
-  it("attributes a team purchase to its redeemers through their coupons", () => {
-    const sarah = makeUser(schema.UserRole.Instructor, "Sarah");
-    const course = makeCourse(sarah.id);
-    const manager = makeStudent("Manager");
-    const [a, b] = [makeStudent(), makeStudent()];
-    const solo = makeStudent("Solo");
-
-    // $150 for 3 seats is $50 a seat. Two seats redeemed, one not.
-    teamPurchase(manager.id, course.id, 15000, 3, [a.id, b.id], daysBefore(5));
-    buyAndEnrol(solo.id, course.id, 6000, daysBefore(5));
-
-    const audience = getAudienceSummary(sarah.id, "30d", NOW);
-
-    // a $50 + b $50 + solo $60 = $160 over 3 students. The unredeemed seat's
-    // $50 belongs to nobody yet.
-    expect(audience.studentCount).toBe(3);
-    expect(audience.attributedRevenueCents).toBe(16000);
-    expect(audience.revenuePerStudentCents).toBe(5333);
-  });
 });
 
 describe("getUnredeemedSeatCount", () => {
@@ -190,8 +173,21 @@ describe("getUnredeemedSeatCount", () => {
     // Marcus: 4 open seats that must not leak into Sarah's count.
     teamPurchase(makeStudent().id, marcusCourse.id, 20000, 4, [], daysBefore(5));
 
-    expect(getUnredeemedSeatCount(sarah.id)).toBe(3);
-    expect(getUnredeemedSeatCount(null)).toBe(7);
+    expect(getUnredeemedSeatCount(sarah.id, "all", NOW)).toBe(3);
+    expect(getUnredeemedSeatCount(null, "all", NOW)).toBe(7);
+  });
+
+  it("only counts seats bought inside the range, the cutoff itself included", () => {
+    const sarah = makeUser(schema.UserRole.Instructor, "Sarah");
+    const course = makeCourse(sarah.id);
+
+    teamPurchase(makeStudent().id, course.id, 9000, 2, [], daysBefore(5));
+    teamPurchase(makeStudent().id, course.id, 4500, 1, [], daysBefore(30)); // exactly at the cutoff
+    teamPurchase(makeStudent().id, course.id, 13500, 3, [], daysBefore(31));
+
+    expect(getUnredeemedSeatCount(sarah.id, "7d", NOW)).toBe(2);
+    expect(getUnredeemedSeatCount(sarah.id, "30d", NOW)).toBe(3);
+    expect(getUnredeemedSeatCount(sarah.id, "all", NOW)).toBe(6);
   });
 });
 
@@ -281,8 +277,16 @@ function comment(lessonId: number, userId: number, parentId?: number) {
     .get();
 }
 
-function rate(userId: number, courseId: number, rating: number) {
-  testDb.insert(schema.courseRatings).values({ userId, courseId, rating }).run();
+function rate(
+  userId: number,
+  courseId: number,
+  rating: number,
+  createdAt = daysBefore(1)
+) {
+  testDb
+    .insert(schema.courseRatings)
+    .values({ userId, courseId, rating, createdAt, updatedAt: createdAt })
+    .run();
 }
 
 describe("getUnansweredQuestionCount", () => {
@@ -301,6 +305,42 @@ describe("getUnansweredQuestionCount", () => {
     expect(getUnansweredQuestionCount(sarah.id)).toBe(1);
     expect(getUnansweredQuestionCount(null)).toBe(2);
   });
+
+  it("matches the instructor question queue across every unanswered rule", () => {
+    const sarah = makeUser(schema.UserRole.Instructor, "Sarah");
+    const admin = makeUser(schema.UserRole.Admin, "Admin");
+    const lesson = makeLesson(makeCourse(sarah.id).id);
+    const [a, b] = [makeStudent(), makeStudent()];
+
+    comment(lesson.id, a.id); // waiting
+    const answeredByAdmin = comment(lesson.id, a.id);
+    comment(lesson.id, admin.id, answeredByAdmin.id);
+    const studentReplyOnly = comment(lesson.id, b.id); // still waiting
+    comment(lesson.id, a.id, studentReplyOnly.id);
+    const deletedReply = comment(lesson.id, b.id); // still waiting
+    const reply = comment(lesson.id, sarah.id, deletedReply.id);
+    testDb
+      .update(schema.comments)
+      .set({ deletedAt: daysBefore(1) })
+      .where(eq(schema.comments.id, reply.id))
+      .run();
+    const deletedQuestion = comment(lesson.id, b.id);
+    testDb
+      .update(schema.comments)
+      .set({ deletedAt: daysBefore(1) })
+      .where(eq(schema.comments.id, deletedQuestion.id))
+      .run();
+    comment(lesson.id, sarah.id); // staff's own question
+    comment(lesson.id, admin.id);
+
+    expect(getUnansweredQuestions(sarah.id)).toHaveLength(3);
+    expect(getUnansweredQuestionCount(sarah.id)).toBe(
+      getUnansweredQuestions(sarah.id).length
+    );
+    expect(getUnansweredQuestionCount(null)).toBe(
+      getUnansweredQuestions(null).length
+    );
+  });
 });
 
 describe("getCourseRatings", () => {
@@ -317,9 +357,29 @@ describe("getCourseRatings", () => {
     rate(c.id, alpha.id, 4);
     rate(a.id, other.id, 1);
 
-    expect(getCourseRatings(sarah.id)).toEqual([
+    expect(getCourseRatings(sarah.id, "all", NOW)).toEqual([
       { courseId: alpha.id, title: "Alpha", averageRating: 4.3, ratingCount: 3 },
       { courseId: beta.id, title: "Beta", averageRating: null, ratingCount: 0 },
+    ]);
+  });
+
+  it("only counts ratings left inside the range, the cutoff itself included", () => {
+    const sarah = makeUser(schema.UserRole.Instructor, "Sarah");
+    const alpha = makeCourse(sarah.id, "Alpha");
+    const [a, b, c] = [makeStudent(), makeStudent(), makeStudent()];
+
+    rate(a.id, alpha.id, 5, daysBefore(2));
+    rate(b.id, alpha.id, 3, daysBefore(30)); // exactly at the cutoff
+    rate(c.id, alpha.id, 1, daysBefore(31));
+
+    expect(getCourseRatings(sarah.id, "7d", NOW)).toEqual([
+      { courseId: alpha.id, title: "Alpha", averageRating: 5, ratingCount: 1 },
+    ]);
+    expect(getCourseRatings(sarah.id, "30d", NOW)).toEqual([
+      { courseId: alpha.id, title: "Alpha", averageRating: 4, ratingCount: 2 },
+    ]);
+    expect(getCourseRatings(sarah.id, "all", NOW)).toEqual([
+      { courseId: alpha.id, title: "Alpha", averageRating: 3, ratingCount: 3 },
     ]);
   });
 });
@@ -337,12 +397,10 @@ describe("an instructor with no data", () => {
     expect(getAudienceSummary(priya.id, "all", NOW)).toEqual({
       buyerCount: 0,
       studentCount: 0,
-      attributedRevenueCents: 0,
-      revenuePerStudentCents: 0,
     });
     expect(getTopBuyers(priya.id, "all", NOW)).toEqual([]);
-    expect(getUnredeemedSeatCount(priya.id)).toBe(0);
+    expect(getUnredeemedSeatCount(priya.id, "all", NOW)).toBe(0);
     expect(getUnansweredQuestionCount(priya.id)).toBe(0);
-    expect(getCourseRatings(priya.id)).toEqual([]);
+    expect(getCourseRatings(priya.id, "all", NOW)).toEqual([]);
   });
 });

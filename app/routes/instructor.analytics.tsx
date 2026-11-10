@@ -4,23 +4,21 @@ import { AlertTriangle, BookOpen } from "lucide-react";
 import type { Route } from "./+types/instructor.analytics";
 import { requireInstructorOrAdmin } from "~/lib/access.server";
 import {
-  getAnalyticsCourses,
-  getCountryRevenue,
-  getCourseProgress,
-  getDropOffFunnel,
-  getQuizPassRates,
+  getAudienceSummary,
+  getCourseDetail,
+  getCourseRatings,
   getRevenueOverTime,
   getRevenueSummary,
+  getTopBuyers,
+  getUnansweredQuestionCount,
+  getUnredeemedSeatCount,
   hasPublishedCourses,
   type RevenuePoint,
   type RevenueSummary,
 } from "~/services/analyticsService";
 import { getUsersByRole } from "~/services/userService";
-import { CourseStatus, UserRole } from "~/db/schema";
-import {
-  CourseDetail,
-  type CourseDetailData,
-} from "~/components/analytics/course-detail";
+import { UserRole } from "~/db/schema";
+import { CourseDetail } from "~/components/analytics/course-detail";
 import {
   ANALYTICS_RANGES,
   ANALYTICS_RANGE_LABELS,
@@ -28,7 +26,7 @@ import {
   parseAnalyticsRange,
   type AnalyticsRange,
 } from "~/lib/analytics";
-import { cn, formatPrice } from "~/lib/utils";
+import { cn, formatCents } from "~/lib/utils";
 import { Button } from "~/components/ui/button";
 import {
   Card,
@@ -56,13 +54,6 @@ import {
   OverviewPanels,
   OverviewPanelsSkeleton,
 } from "~/components/analytics/overview-panels";
-import {
-  getAudienceSummary,
-  getCourseRatings,
-  getTopBuyers,
-  getUnansweredQuestionCount,
-  getUnredeemedSeatCount,
-} from "~/services/analyticsService";
 
 // ─── Instructor Analytics ───
 // "How is my teaching business doing?" — one page, two tabs. All view state
@@ -116,7 +107,11 @@ export async function loader({ request }: Route.LoaderArgs) {
     instructorId,
     courseDetail:
       tab === "course"
-        ? loadCourseDetail(instructorId, params.get("course"), range)
+        ? getCourseDetail(
+            instructorId,
+            Number(params.get("course")) || null,
+            range
+          )
         : null,
     hasPublishedCourses: hasPublishedCourses(instructorId),
     revenue: getRevenueSummary(instructorId, range),
@@ -124,46 +119,10 @@ export async function loader({ request }: Route.LoaderArgs) {
     overview: {
       audience: getAudienceSummary(instructorId, range),
       topBuyers: getTopBuyers(instructorId, range),
-      unredeemedSeats: getUnredeemedSeatCount(instructorId),
+      unredeemedSeats: getUnredeemedSeatCount(instructorId, range),
       unansweredQuestions: getUnansweredQuestionCount(instructorId),
-      ratings: getCourseRatings(instructorId),
+      ratings: getCourseRatings(instructorId, range),
     },
-  };
-}
-
-/**
- * `?course=<id>` is honoured only if it's one of the viewer's courses;
- * otherwise the first published course (or first course) is selected.
- */
-function loadCourseDetail(
-  instructorId: number | null,
-  courseParam: string | null,
-  range: AnalyticsRange
-): CourseDetailData {
-  const courses = getAnalyticsCourses(instructorId);
-  const selected =
-    courses.find((c) => c.id === Number(courseParam)) ??
-    courses.find((c) => c.status === CourseStatus.Published) ??
-    courses[0];
-  if (!selected) {
-    return {
-      courses,
-      selectedCourseId: null,
-      range,
-      progress: null,
-      funnel: null,
-      quizPassRates: [],
-      countryRevenue: null,
-    };
-  }
-  return {
-    courses,
-    selectedCourseId: selected.id,
-    range,
-    progress: getCourseProgress(selected.id),
-    funnel: getDropOffFunnel(selected.id),
-    quizPassRates: getQuizPassRates(selected.id),
-    countryRevenue: getCountryRevenue(selected.id, range),
   };
 }
 
@@ -434,10 +393,6 @@ function RevenueChart({
   );
 }
 
-/** "$0.00" for zero, rather than formatPrice's "Free". */
-function formatCents(cents: number) {
-  return cents === 0 ? "$0.00" : formatPrice(cents);
-}
 
 const MONTHS = [
   "Jan",

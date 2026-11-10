@@ -268,18 +268,19 @@ export type QueuedQuestion = {
   authorAvatarUrl: string | null;
 };
 
+const questionAuthor = alias(users, "author");
+
 /**
- * Questions still waiting on an answer, newest first.
- *
- * A question qualifies when it is top-level, not deleted, not written by staff,
- * and has no reply from the course's instructor or an admin. Pass null for
- * instructorId to span every course (admins); pass an id to scope to the
+ * The one definition of "unanswered", shared by the queue and its count. A
+ * question qualifies when it is top-level, not deleted, not written by staff,
+ * and has no live reply from the course's instructor or an admin. Pass null
+ * for instructorId to span every course (admins); pass an id to scope to the
  * courses that instructor owns.
+ *
+ * Expects a query over `comments` joined to `questionAuthor`, `lessons`,
+ * `modules` and `courses`, as both callers below do.
  */
-export function getUnansweredQuestions(
-  instructorId: number | null
-): QueuedQuestion[] {
-  const author = alias(users, "author");
+function unansweredQuestionFilter(instructorId: number | null) {
   const reply = alias(comments, "reply");
   const replyAuthor = alias(users, "reply_author");
 
@@ -299,19 +300,24 @@ export function getUnansweredQuestions(
       )
     );
 
-  const conditions = [
+  return and(
     isNull(comments.parentId),
     isNull(comments.deletedAt),
     // Staff asking their own question shouldn't queue up as work for themselves.
-    ne(author.role, UserRole.Admin),
+    ne(questionAuthor.role, UserRole.Admin),
     ne(comments.userId, courses.instructorId),
     notExists(staffReply),
-  ];
+    instructorId === null ? undefined : eq(courses.instructorId, instructorId)
+  );
+}
 
-  if (instructorId !== null) {
-    conditions.push(eq(courses.instructorId, instructorId));
-  }
-
+/**
+ * Questions still waiting on an answer, newest first. See
+ * `unansweredQuestionFilter` for what counts as unanswered.
+ */
+export function getUnansweredQuestions(
+  instructorId: number | null
+): QueuedQuestion[] {
   return db
     .select({
       id: comments.id,
@@ -321,16 +327,30 @@ export function getUnansweredQuestions(
       lessonTitle: lessons.title,
       courseTitle: courses.title,
       courseSlug: courses.slug,
-      authorId: author.id,
-      authorName: author.name,
-      authorAvatarUrl: author.avatarUrl,
+      authorId: questionAuthor.id,
+      authorName: questionAuthor.name,
+      authorAvatarUrl: questionAuthor.avatarUrl,
     })
     .from(comments)
-    .innerJoin(author, eq(comments.userId, author.id))
+    .innerJoin(questionAuthor, eq(comments.userId, questionAuthor.id))
     .innerJoin(lessons, eq(comments.lessonId, lessons.id))
     .innerJoin(modules, eq(lessons.moduleId, modules.id))
     .innerJoin(courses, eq(modules.courseId, courses.id))
-    .where(and(...conditions))
+    .where(unansweredQuestionFilter(instructorId))
     .orderBy(desc(comments.createdAt), desc(comments.id))
     .all();
+}
+
+/** How many questions `getUnansweredQuestions` would return, counted in SQL. */
+export function countUnansweredQuestions(instructorId: number | null): number {
+  const row = db
+    .select({ count: sql<number>`count(*)` })
+    .from(comments)
+    .innerJoin(questionAuthor, eq(comments.userId, questionAuthor.id))
+    .innerJoin(lessons, eq(comments.lessonId, lessons.id))
+    .innerJoin(modules, eq(lessons.moduleId, modules.id))
+    .innerJoin(courses, eq(modules.courseId, courses.id))
+    .where(unansweredQuestionFilter(instructorId))
+    .get();
+  return row?.count ?? 0;
 }

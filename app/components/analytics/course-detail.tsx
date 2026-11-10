@@ -4,6 +4,7 @@ import { CourseStatus } from "~/db/schema";
 import type {
   AnalyticsCourse,
   CountryRevenueMix,
+  CourseDetailData,
   CourseProgress,
   DropOffFunnel,
   FunnelLesson,
@@ -11,7 +12,7 @@ import type {
 } from "~/services/analyticsService";
 import { ANALYTICS_RANGE_LABELS, type AnalyticsRange } from "~/lib/analytics";
 import { COUNTRIES } from "~/lib/ppp";
-import { formatPrice } from "~/lib/utils";
+import { formatCents } from "~/lib/utils";
 import {
   Card,
   CardContent,
@@ -29,20 +30,11 @@ import {
 
 // ─── Course detail tab ───
 // Pick one course and diagnose it. The picker writes `?course=<id>`; the
-// loader resolves it against the courses this viewer may see. Lesson progress
+// analytics service (getCourseDetail) resolves it against the courses this
+// viewer may see. Lesson progress
 // has no start timestamp, so those panels ignore the range filter and say
 // "all time" instead; quiz pass rates are per student on their best attempt,
 // also all time. Only the country revenue mix follows the range.
-
-export type CourseDetailData = {
-  courses: AnalyticsCourse[];
-  selectedCourseId: number | null;
-  range: AnalyticsRange;
-  progress: CourseProgress | null;
-  funnel: DropOffFunnel | null;
-  quizPassRates: QuizPassRate[];
-  countryRevenue: CountryRevenueMix | null;
-};
 
 const ALL_TIME = "All time";
 
@@ -329,7 +321,7 @@ function CountryRevenueCard({
           <div className="space-y-5">
             <div className="rounded-md border p-3">
               <p className="text-sm text-muted-foreground">
-                From PPP-discounted countries
+                Sold at a PPP-discounted price
               </p>
               <p className="text-2xl font-semibold tabular-nums">
                 {Math.round(mix.discountedShare * 100)}%
@@ -349,7 +341,7 @@ function CountryRevenueCard({
                     {row.country
                       ? (COUNTRY_NAMES.get(row.country) ?? row.country)
                       : "Unknown"}
-                    {row.discount > 0 && (
+                    {row.discountedCents > 0 && row.discount > 0 && (
                       <span className="ml-1.5 text-xs text-muted-foreground">
                         {Math.round(row.discount * 100)}% off
                       </span>
@@ -372,10 +364,6 @@ function CountryRevenueCard({
   );
 }
 
-/** `formatPrice` renders 0 as "Free", which reads wrong for revenue. */
-function formatCents(cents: number) {
-  return cents === 0 ? "$0.00" : formatPrice(cents);
-}
 
 /** The app's progress-bar idiom: a plain div track and fill. */
 function Bar({ fraction }: { fraction: number }) {
